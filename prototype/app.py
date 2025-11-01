@@ -21,6 +21,8 @@ from backend.analyzers.submarket_ranker import SubmarketRanker
 from backend.analyzers.land_analyzer import LandOpportunityAnalyzer
 from backend.analyzers.financial_optimizer import FinancialOptimizer
 from backend.ai_engine.rag_system import QdrantRAGSystem
+from backend.analyzers.feature_analyzer import feature_analyzer
+from backend.analyzers.demand_predictor import demand_predictor
 from config.settings import settings
 
 # Page config
@@ -102,8 +104,9 @@ def main():
         
         page = st.radio(
             "Navigation",
-            ["🏠 Dashboard", "📊 Market Analysis", "🏞️ Land Opportunities", 
-             "🏗️ Product Intelligence", "💰 Financial Modeling", "🤖 AI Assistant"]
+            ["🏠 Dashboard", "📊 Market Analysis", "🎯 Micro-Market Analysis",
+             "🏞️ Land Opportunities", "🏗️ Product Intelligence", 
+             "💰 Financial Modeling", "🤖 AI Assistant"]
         )
         
         st.markdown("---")
@@ -123,6 +126,8 @@ def main():
         show_dashboard()
     elif page == "📊 Market Analysis":
         show_market_analysis()
+    elif page == "🎯 Micro-Market Analysis":
+        show_micro_market_analysis()
     elif page == "🏞️ Land Opportunities":
         show_land_opportunities()
     elif page == "🏗️ Product Intelligence":
@@ -492,6 +497,356 @@ def show_product_intelligence():
                     st.markdown(f"**{incentive['incentive']}**")
                 with col2:
                     st.metric("DOM Reduction", f"{incentive['days_on_market_reduction']} days")
+
+
+def show_micro_market_analysis():
+    """Show micro-market analysis with subdivision filtering."""
+    st.header("🎯 Micro-Market Analysis")
+    
+    st.markdown("""
+    **Hyper-local intelligence:** Analyze specific subdivisions and neighborhoods within a ZIP code.  
+    Same ZIP code, different recommendations!
+    """)
+    
+    # Tabs for different analysis types
+    tab1, tab2, tab3 = st.tabs(["📍 Subdivision Analysis", "🔄 Compare Subdivisions", "📏 Radius Search"])
+    
+    # TAB 1: Subdivision Analysis
+    with tab1:
+        st.subheader("Analyze Specific Subdivision")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            zip_code = st.text_input("ZIP Code", value="27410", key="sub_zip")
+        
+        with col2:
+            months_back = st.selectbox("Historical Period", [6, 12, 24, 36], index=1, key="sub_months")
+        
+        # Get available subdivisions button
+        if st.button("🔍 Show Available Subdivisions", key="get_subdivs"):
+            with st.spinner("Fetching subdivisions..."):
+                try:
+                    subdivisions = feature_analyzer.get_subdivisions(zip_code)
+                    
+                    if subdivisions:
+                        st.session_state.subdivisions = subdivisions
+                        st.success(f"✅ Found {len(subdivisions)} subdivisions in ZIP {zip_code}")
+                    else:
+                        st.warning("No subdivisions found in this ZIP code")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+        
+        # Show subdivision selector if available
+        if hasattr(st.session_state, 'subdivisions') and st.session_state.subdivisions:
+            st.markdown("---")
+            
+            # Show top subdivisions
+            top_subdivs = st.session_state.subdivisions[:20]
+            subdiv_df = pd.DataFrame(top_subdivs)
+            
+            st.markdown("**Top 20 Subdivisions by Property Count:**")
+            st.dataframe(subdiv_df, use_container_width=True, hide_index=True)
+            
+            # Subdivision selector
+            subdiv_name = st.selectbox(
+                "Select Subdivision to Analyze",
+                ["All (No Filter)"] + [s['name'] for s in top_subdivs],
+                key="selected_subdiv"
+            )
+            
+            if st.button("🚀 Analyze", type="primary", key="analyze_subdiv"):
+                with st.spinner(f"Analyzing {subdiv_name}..."):
+                    try:
+                        # Determine if filtering by subdivision
+                        subdivision_filter = None if subdiv_name == "All (No Filter)" else subdiv_name
+                        
+                        # Run feature analysis
+                        feature_analysis = feature_analyzer.analyze_feature_impact(
+                            zip_code,
+                            months_back=months_back,
+                            min_samples=5,
+                            subdivision=subdivision_filter
+                        )
+                        
+                        # Run demand prediction
+                        demand_analysis = demand_predictor.predict_optimal_config(
+                            zip_code,
+                            months_back=months_back,
+                            min_samples=5,
+                            subdivision=subdivision_filter
+                        )
+                        
+                        # Check for errors
+                        if 'error' in feature_analysis or 'error' in demand_analysis:
+                            st.error(f"Insufficient data for {subdiv_name}. Try selecting a different subdivision or increase the historical period.")
+                        else:
+                            # Display results
+                            st.success("✅ Analysis complete!")
+                            
+                            # Market Overview
+                            st.markdown("---")
+                            st.subheader("📊 Market Overview")
+                            
+                            market_stats = feature_analysis['market_stats']
+                            optimal = demand_analysis['optimal_config']
+                            
+                            col1, col2, col3, col4 = st.columns(4)
+                            
+                            with col1:
+                                st.metric("Properties Analyzed", feature_analysis['property_count'])
+                            with col2:
+                                st.metric("Median Price", format_currency(market_stats.get('median_sale_price', 0)))
+                            with col3:
+                                st.metric("Median Size", f"{market_stats.get('median_size', 0):,.0f} sqft")
+                            with col4:
+                                st.metric("Price/SqFt", f"${market_stats.get('median_price_per_sqft', 0):.2f}")
+                            
+                            # Optimal Configuration
+                            st.markdown("---")
+                            st.subheader("🎯 Optimal Build Recommendation")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                st.metric("Bedrooms", optimal['bedrooms'])
+                            with col2:
+                                st.metric("Bathrooms", optimal['bathrooms'])
+                            with col3:
+                                st.metric("Square Feet", f"{optimal['sqft']:,}")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                st.metric("Expected Price", format_currency(optimal['median_sale_price']))
+                            with col2:
+                                st.metric("Sales Velocity", f"{optimal['sales_velocity']:.1f} units/mo")
+                            with col3:
+                                confidence_pct = optimal['confidence'] * 100
+                                st.metric("Confidence", f"{confidence_pct:.0f}%")
+                            
+                            st.info(f"**Why:** {optimal['rationale']}")
+                            
+                            # Configuration Performance
+                            st.markdown("---")
+                            st.subheader("📈 Configuration Performance")
+                            
+                            config_df = pd.DataFrame(demand_analysis['all_configurations'][:5])
+                            
+                            if not config_df.empty:
+                                fig = px.bar(config_df, 
+                                           x='configuration', 
+                                           y='sales_velocity',
+                                           color='demand_score',
+                                           title="Sales Velocity by Configuration",
+                                           labels={'sales_velocity': 'Sales per Month', 'configuration': 'Configuration'})
+                                st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Top Features
+                            st.markdown("---")
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.subheader("✨ Top Interior Features")
+                                interior = feature_analysis.get('interior_features', [])[:5]
+                                if interior:
+                                    for feat in interior:
+                                        with st.expander(f"{feat['feature']} ({feat['value']})"):
+                                            st.write(f"**Priority:** {feat['priority'].title()}")
+                                            st.write(feat['rationale'])
+                                else:
+                                    st.info("No interior features analyzed")
+                            
+                            with col2:
+                                st.subheader("🏠 Top Exterior Features")
+                                exterior = feature_analysis.get('exterior_features', [])[:5]
+                                if exterior:
+                                    for feat in exterior:
+                                        with st.expander(f"{feat['feature']} ({feat['value']})"):
+                                            st.write(f"**Priority:** {feat['priority'].title()}")
+                                            st.write(feat['rationale'])
+                                else:
+                                    st.info("No exterior features analyzed")
+                        
+                    except Exception as e:
+                        st.error(f"Error during analysis: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+    
+    # TAB 2: Compare Subdivisions
+    with tab2:
+        st.subheader("Compare Multiple Subdivisions")
+        
+        zip_code_compare = st.text_input("ZIP Code", value="27410", key="compare_zip")
+        
+        if st.button("🔍 Load Subdivisions", key="get_subdivs_compare"):
+            with st.spinner("Fetching subdivisions..."):
+                try:
+                    subdivisions = feature_analyzer.get_subdivisions(zip_code_compare)
+                    if subdivisions:
+                        st.session_state.subdivisions_compare = subdivisions
+                        st.success(f"✅ Found {len(subdivisions)} subdivisions")
+                    else:
+                        st.warning("No subdivisions found")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+        
+        if hasattr(st.session_state, 'subdivisions_compare') and st.session_state.subdivisions_compare:
+            top_subdivs = st.session_state.subdivisions_compare[:15]
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                subdiv1 = st.selectbox("First Subdivision", [s['name'] for s in top_subdivs], key="compare1")
+            
+            with col2:
+                subdiv2 = st.selectbox("Second Subdivision", [s['name'] for s in top_subdivs], index=1 if len(top_subdivs) > 1 else 0, key="compare2")
+            
+            if st.button("⚖️ Compare", type="primary", key="run_compare"):
+                with st.spinner("Running comparison..."):
+                    try:
+                        results = []
+                        
+                        for subdiv in [subdiv1, subdiv2]:
+                            # Analyze each subdivision
+                            feature_analysis = feature_analyzer.analyze_feature_impact(
+                                zip_code_compare,
+                                months_back=24,
+                                min_samples=3,
+                                subdivision=subdiv
+                            )
+                            
+                            demand_analysis = demand_predictor.predict_optimal_config(
+                                zip_code_compare,
+                                months_back=24,
+                                min_samples=3,
+                                subdivision=subdiv
+                            )
+                            
+                            if 'error' not in feature_analysis and 'error' not in demand_analysis:
+                                results.append({
+                                    'name': subdiv,
+                                    'feature': feature_analysis,
+                                    'demand': demand_analysis
+                                })
+                        
+                        if len(results) == 2:
+                            st.success("✅ Comparison complete!")
+                            
+                            # Side-by-side comparison
+                            col1, col2 = st.columns(2)
+                            
+                            for i, result in enumerate(results):
+                                with (col1 if i == 0 else col2):
+                                    st.markdown(f"### {result['name']}")
+                                    
+                                    stats = result['feature']['market_stats']
+                                    optimal = result['demand']['optimal_config']
+                                    
+                                    st.metric("Properties", result['feature']['property_count'])
+                                    st.metric("Median Price", format_currency(stats.get('median_sale_price', 0)))
+                                    st.metric("Median Size", f"{stats.get('median_size', 0):,.0f} sqft")
+                                    st.metric("Price/SqFt", f"${stats.get('median_price_per_sqft', 0):.2f}")
+                                    
+                                    st.markdown("**Optimal Build:**")
+                                    st.write(f"**{optimal['configuration']}** @ {optimal['sqft']:,} sqft")
+                                    st.write(f"Expected: {format_currency(optimal['median_sale_price'])}")
+                            
+                            # Comparison insights
+                            st.markdown("---")
+                            st.subheader("💡 Key Differences")
+                            
+                            price_diff = results[0]['feature']['market_stats'].get('median_sale_price', 0) - results[1]['feature']['market_stats'].get('median_sale_price', 0)
+                            size_diff = results[0]['feature']['market_stats'].get('median_size', 0) - results[1]['feature']['market_stats'].get('median_size', 0)
+                            
+                            st.write(f"**Price Difference:** {format_currency(abs(price_diff))} ({results[0]['name'] if price_diff > 0 else results[1]['name']} is higher)")
+                            st.write(f"**Size Difference:** {abs(size_diff):,.0f} sqft ({results[0]['name'] if size_diff > 0 else results[1]['name']} is larger)")
+                            
+                            st.info("💡 **Insight:** Same ZIP code, but build different products for each subdivision!")
+                        
+                        else:
+                            st.warning("Could not analyze one or both subdivisions. Try different selections.")
+                    
+                    except Exception as e:
+                        st.error(f"Error during comparison: {str(e)}")
+    
+    # TAB 3: Radius Search
+    with tab3:
+        st.subheader("Analyze Properties Within Radius")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            zip_code_radius = st.text_input("ZIP Code", value="27410", key="radius_zip")
+        
+        with col2:
+            center_lat = st.number_input("Latitude", value=36.089, format="%.6f", key="radius_lat")
+        
+        with col3:
+            center_lon = st.number_input("Longitude", value=-79.908, format="%.6f", key="radius_lon")
+        
+        radius_miles = st.slider("Radius (miles)", 0.25, 2.0, 0.5, 0.25, key="radius_miles")
+        
+        st.info("💡 **Tip:** Use Google Maps to find the latitude/longitude of your lot. Right-click on the location and select 'What's here?'")
+        
+        if st.button("🎯 Analyze Radius", type="primary", key="analyze_radius"):
+            with st.spinner(f"Analyzing properties within {radius_miles} miles..."):
+                try:
+                    # Run analysis with radius filter
+                    feature_analysis = feature_analyzer.analyze_feature_impact(
+                        zip_code_radius,
+                        months_back=24,
+                        min_samples=3,
+                        radius_miles=radius_miles,
+                        center_lat=center_lat,
+                        center_lon=center_lon
+                    )
+                    
+                    demand_analysis = demand_predictor.predict_optimal_config(
+                        zip_code_radius,
+                        months_back=24,
+                        min_samples=3,
+                        radius_miles=radius_miles,
+                        center_lat=center_lat,
+                        center_lon=center_lon
+                    )
+                    
+                    if 'error' in feature_analysis or 'error' in demand_analysis:
+                        st.warning(f"Insufficient data within {radius_miles} miles. Try increasing the radius or choosing a different location.")
+                    else:
+                        st.success(f"✅ Found {feature_analysis['property_count']} properties within {radius_miles} miles!")
+                        
+                        # Display results (similar to Tab 1)
+                        market_stats = feature_analysis['market_stats']
+                        optimal = demand_analysis['optimal_config']
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            st.metric("Properties", feature_analysis['property_count'])
+                        with col2:
+                            st.metric("Median Price", format_currency(market_stats.get('median_sale_price', 0)))
+                        with col3:
+                            st.metric("Median Size", f"{market_stats.get('median_size', 0):,.0f} sqft")
+                        with col4:
+                            st.metric("Price/SqFt", f"${market_stats.get('median_price_per_sqft', 0):.2f}")
+                        
+                        st.markdown("---")
+                        st.subheader("🎯 Optimal Build for This Location")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric("Configuration", optimal['configuration'])
+                        with col2:
+                            st.metric("Expected Price", format_currency(optimal['median_sale_price']))
+                        with col3:
+                            st.metric("Confidence", f"{optimal['confidence']*100:.0f}%")
+                        
+                        st.info(f"**Rationale:** {optimal['rationale']}")
+                
+                except Exception as e:
+                    st.error(f"Error during analysis: {str(e)}")
 
 
 def show_financial_modeling():
