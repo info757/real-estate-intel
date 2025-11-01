@@ -792,11 +792,11 @@ def show_micro_market_analysis():
         if st.button("🎯 Analyze Radius", type="primary", key="analyze_radius"):
             with st.spinner(f"Analyzing properties within {radius_miles} miles..."):
                 try:
-                    # Run analysis with radius filter
+                    # Run analysis with radius filter (lower threshold for small areas)
                     feature_analysis = feature_analyzer.analyze_feature_impact(
                         zip_code_radius,
                         months_back=24,
-                        min_samples=3,
+                        min_samples=1,  # Lower threshold for radius search
                         radius_miles=radius_miles,
                         center_lat=center_lat,
                         center_lon=center_lon
@@ -805,16 +805,19 @@ def show_micro_market_analysis():
                     demand_analysis = demand_predictor.predict_optimal_config(
                         zip_code_radius,
                         months_back=24,
-                        min_samples=3,
+                        min_samples=1,  # Lower threshold for radius search
                         radius_miles=radius_miles,
                         center_lat=center_lat,
                         center_lon=center_lon
                     )
                     
                     if 'error' in feature_analysis or 'error' in demand_analysis:
-                        st.warning(f"Insufficient data within {radius_miles} miles. Try increasing the radius or choosing a different location.")
+                        error_msg = feature_analysis.get('error') or demand_analysis.get('error')
+                        st.warning(f"⚠️ Insufficient data within {radius_miles} miles.")
+                        st.info(f"**Found:** {feature_analysis.get('property_count', 0)} properties\n\n**Issue:** {error_msg}\n\n💡 Try increasing the radius or choosing a location with more recent sales.")
                     elif 'optimal_config' not in demand_analysis or not demand_analysis['optimal_config']:
-                        st.warning(f"Found {feature_analysis.get('property_count', 0)} properties but not enough data for analysis. Try increasing the radius.")
+                        st.warning(f"⚠️ Found {feature_analysis.get('property_count', 0)} properties but couldn't generate recommendation.")
+                        st.info("💡 The properties may not have complete data (beds/baths/size). Try increasing the radius to 1.5 or 2 miles.")
                     else:
                         st.success(f"✅ Found {feature_analysis['property_count']} properties within {radius_miles} miles!")
                         
