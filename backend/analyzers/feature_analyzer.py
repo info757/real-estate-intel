@@ -30,20 +30,34 @@ class FeatureAnalyzer:
         self,
         zip_code: str,
         months_back: int = 12,
-        min_samples: int = 10
+        min_samples: int = 10,
+        subdivision: Optional[str] = None,
+        radius_miles: Optional[float] = None,
+        center_lat: Optional[float] = None,
+        center_lon: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Analyze feature impact for a ZIP code.
+        Analyze feature impact for a ZIP code or micro-market.
         
         Args:
             zip_code: ZIP code to analyze
             months_back: How many months of sales to analyze
             min_samples: Minimum number of samples for reliable analysis
+            subdivision: Optional subdivision name to filter by
+            radius_miles: Optional radius in miles (requires center_lat/center_lon)
+            center_lat: Center latitude for radius search
+            center_lon: Center longitude for radius search
         
         Returns:
             Feature impact analysis with scores and recommendations
         """
-        logger.info(f"Analyzing features for ZIP {zip_code}")
+        market_desc = f"ZIP {zip_code}"
+        if subdivision:
+            market_desc += f", subdivision '{subdivision}'"
+        if radius_miles and center_lat and center_lon:
+            market_desc += f", within {radius_miles} miles of ({center_lat:.4f}, {center_lon:.4f})"
+        
+        logger.info(f"Analyzing features for {market_desc}")
         
         # Get recent sales data
         cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
@@ -52,6 +66,16 @@ class FeatureAnalyzer:
             max_pages=5,
             min_sale_date=cutoff_date
         )
+        
+        # Filter by subdivision if specified
+        if subdivision and properties:
+            properties = self._filter_by_subdivision(properties, subdivision)
+            logger.info(f"Filtered to {len(properties)} properties in subdivision")
+        
+        # Filter by radius if specified
+        if radius_miles and center_lat and center_lon and properties:
+            properties = self._filter_by_radius(properties, center_lat, center_lon, radius_miles)
+            logger.info(f"Filtered to {len(properties)} properties within {radius_miles} miles")
         
         if not properties or len(properties) < min_samples:
             logger.warning(f"Insufficient data for ZIP {zip_code}: {len(properties) if properties else 0} properties")
@@ -479,6 +503,88 @@ class FeatureAnalyzer:
         all_features.sort(key=lambda x: x.get('impact_score', 0), reverse=True)
         
         return all_features[:top_n]
+    
+    def _filter_by_subdivision(
+        self,
+        properties: List[Dict[str, Any]],
+        subdivision: str
+    ) -> List[Dict[str, Any]]:
+        """Filter properties by subdivision name (case-insensitive partial match)."""
+        subdivision_upper = subdivision.upper()
+        return [
+            p for p in properties
+            if subdivision_upper in p.get('area', {}).get('subdname', '').upper()
+        ]
+    
+    def _filter_by_radius(
+        self,
+        properties: List[Dict[str, Any]],
+        center_lat: float,
+        center_lon: float,
+        radius_miles: float
+    ) -> List[Dict[str, Any]]:
+        """Filter properties within radius of center point."""
+        import math
+        
+        def haversine_distance(lat1, lon1, lat2, lon2):
+            """Calculate distance in miles between two points."""
+            R = 3959  # Earth's radius in miles
+            
+            lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            
+            a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+            c = 2 * math.asin(math.sqrt(a))
+            
+            return R * c
+        
+        filtered = []
+        for p in properties:
+            try:
+                lat = float(p.get('location', {}).get('latitude', 0))
+                lon = float(p.get('location', {}).get('longitude', 0))
+                
+                if lat and lon:
+                    distance = haversine_distance(center_lat, center_lon, lat, lon)
+                    if distance <= radius_miles:
+                        filtered.append(p)
+            except (ValueError, TypeError):
+                continue
+        
+        return filtered
+    
+    def get_subdivisions(self, zip_code: str) -> List[Dict[str, Any]]:
+        """
+        Get list of subdivisions in a ZIP code with property counts.
+        
+        Args:
+            zip_code: ZIP code
+        
+        Returns:
+            List of subdivisions with counts
+        """
+        properties = self.attom.get_all_sales_paginated(zip_code, max_pages=5)
+        
+        if not properties:
+            return []
+        
+        subdivisions = {}
+        for p in properties:
+            subdname = p.get('area', {}).get('subdname', 'Unknown')
+            if subdname not in subdivisions:
+                subdivisions[subdname] = 0
+            subdivisions[subdname] += 1
+        
+        result = [
+            {"name": name, "count": count}
+            for name, count in subdivisions.items()
+        ]
+        
+        # Sort by count descending
+        result.sort(key=lambda x: x['count'], reverse=True)
+        
+        return result
 
 
 # Global instance
