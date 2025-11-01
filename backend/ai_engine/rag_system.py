@@ -9,10 +9,8 @@ from datetime import datetime
 import logging
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from config.settings import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -28,13 +26,13 @@ class QdrantRAGSystem:
         
         # Initialize OpenAI embeddings
         self.embeddings = OpenAIEmbeddings(
-            openai_api_key=settings.openai_api_key
+            api_key=settings.openai_api_key
         )
         
         # Initialize LLM
         self.llm = ChatOpenAI(
-            model_name=settings.openai_model,
-            openai_api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            api_key=settings.openai_api_key,
             temperature=0.7
         )
         
@@ -306,7 +304,7 @@ class QdrantRAGSystem:
                 HumanMessage(content=prompt)
             ]
             
-            response = self.llm(messages)
+            response = self.llm.invoke(messages)
             answer = response.content
             
             sources = [doc["metadata"].get("doc_id", "Unknown") for doc in relevant_docs]

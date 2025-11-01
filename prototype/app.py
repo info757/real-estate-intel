@@ -97,7 +97,7 @@ def main():
     
     # Sidebar
     with st.sidebar:
-        st.image("https://via.placeholder.com/150x50/1f77b4/FFFFFF?text=RE+Intel", use_container_width=True)
+        st.markdown("### 🏘️ RE Intel")
         st.markdown("---")
         
         page = st.radio(
