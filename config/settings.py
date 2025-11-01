@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     qdrant_use_https: bool = Field(default=False, env="QDRANT_USE_HTTPS")
     
     # Data Source APIs
+    attom_api_key: str = Field(default="", env="ATTOM_API_KEY")
+    attom_api_base_url: str = Field(default="https://api.gateway.attomdata.com", env="ATTOM_API_BASE_URL")
     greatschools_api_key: str = Field(default="", env="GREATSCHOOLS_API_KEY")
     census_api_key: str = Field(default="", env="CENSUS_API_KEY")
     zillow_api_key: str = Field(default="", env="ZILLOW_API_KEY")
