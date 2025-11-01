@@ -837,13 +837,16 @@ def show_micro_market_analysis():
                         col1, col2, col3 = st.columns(3)
                         
                         with col1:
-                            st.metric("Configuration", optimal['configuration'])
+                            st.metric("Bedrooms", optimal['bedrooms'])
+                            st.metric("Bathrooms", optimal['bathrooms'])
                         with col2:
+                            st.metric("Square Feet", f"{optimal['sqft']:,}")
                             st.metric("Expected Price", format_currency(optimal['median_sale_price']))
                         with col3:
+                            st.metric("Sales Velocity", f"{optimal['sales_velocity']:.1f} units/mo")
                             st.metric("Confidence", f"{optimal['confidence']*100:.0f}%")
                         
-                        st.info(f"**Rationale:** {optimal['rationale']}")
+                        st.info(f"**Why:** {optimal['rationale']}")
                 
                 except Exception as e:
                     st.error(f"Error during analysis: {str(e)}")
