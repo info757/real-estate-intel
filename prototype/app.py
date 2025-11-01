@@ -813,11 +813,13 @@ def show_micro_market_analysis():
                     
                     if 'error' in feature_analysis or 'error' in demand_analysis:
                         st.warning(f"Insufficient data within {radius_miles} miles. Try increasing the radius or choosing a different location.")
+                    elif 'optimal_config' not in demand_analysis or not demand_analysis['optimal_config']:
+                        st.warning(f"Found {feature_analysis.get('property_count', 0)} properties but not enough data for analysis. Try increasing the radius.")
                     else:
                         st.success(f"✅ Found {feature_analysis['property_count']} properties within {radius_miles} miles!")
                         
                         # Display results (similar to Tab 1)
-                        market_stats = feature_analysis['market_stats']
+                        market_stats = feature_analysis.get('market_stats', {})
                         optimal = demand_analysis['optimal_config']
                         
                         col1, col2, col3, col4 = st.columns(4)
@@ -837,19 +839,20 @@ def show_micro_market_analysis():
                         col1, col2, col3 = st.columns(3)
                         
                         with col1:
-                            st.metric("Bedrooms", optimal['bedrooms'])
-                            st.metric("Bathrooms", optimal['bathrooms'])
+                            st.metric("Bedrooms", optimal.get('bedrooms', 'N/A'))
+                            st.metric("Bathrooms", optimal.get('bathrooms', 'N/A'))
                         with col2:
-                            st.metric("Square Feet", f"{optimal['sqft']:,}")
-                            st.metric("Expected Price", format_currency(optimal['median_sale_price']))
+                            st.metric("Square Feet", f"{optimal.get('sqft', 0):,}")
+                            st.metric("Expected Price", format_currency(optimal.get('median_sale_price', 0)))
                         with col3:
-                            st.metric("Sales Velocity", f"{optimal['sales_velocity']:.1f} units/mo")
-                            st.metric("Confidence", f"{optimal['confidence']*100:.0f}%")
+                            st.metric("Sales Velocity", f"{optimal.get('sales_velocity', 0):.1f} units/mo")
+                            st.metric("Confidence", f"{optimal.get('confidence', 0)*100:.0f}%")
                         
-                        st.info(f"**Why:** {optimal['rationale']}")
+                        st.info(f"**Why:** {optimal.get('rationale', 'Analysis complete')}")
                 
                 except Exception as e:
                     st.error(f"Error during analysis: {str(e)}")
+                    st.info("💡 **Tips:** Try increasing the radius, or use a different ZIP code with more properties.")
 
 
 def show_financial_modeling():
