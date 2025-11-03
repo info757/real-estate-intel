@@ -619,23 +619,23 @@ def show_micro_market_analysis():
                             col1, col2, col3 = st.columns(3)
                             
                             with col1:
-                                st.metric("Bedrooms", optimal['bedrooms'])
+                                st.metric("Bedrooms", optimal.get('bedrooms', 'N/A'))
                             with col2:
-                                st.metric("Bathrooms", optimal['bathrooms'])
+                                st.metric("Bathrooms", optimal.get('bathrooms', 'N/A'))
                             with col3:
-                                st.metric("Square Feet", f"{optimal['sqft']:,}")
+                                st.metric("Square Feet", f"{optimal.get('sqft', 0):,}")
                             
                             col1, col2, col3 = st.columns(3)
                             
                             with col1:
-                                st.metric("Expected Price", format_currency(optimal['median_sale_price']))
+                                st.metric("Expected Price", format_currency(optimal.get('median_sale_price', 0)))
                             with col2:
-                                st.metric("Sales Velocity", f"{optimal['sales_velocity']:.1f} units/mo")
+                                st.metric("Sales Velocity", f"{optimal.get('sales_velocity', 0):.1f} units/mo")
                             with col3:
-                                confidence_pct = optimal['confidence'] * 100
+                                confidence_pct = optimal.get('confidence', 0) * 100
                                 st.metric("Confidence", f"{confidence_pct:.0f}%")
                             
-                            st.info(f"**Why:** {optimal['rationale']}")
+                            st.info(f"**Why:** {optimal.get('rationale', 'Analysis complete')}")
                             
                             # Configuration Performance
                             st.markdown("---")
@@ -680,8 +680,10 @@ def show_micro_market_analysis():
                         
                     except Exception as e:
                         st.error(f"Error during analysis: {str(e)}")
-                        import traceback
-                        st.code(traceback.format_exc())
+                        st.info("💡 **Tips:** Try a different subdivision or property type, or increase the historical period.")
+                        with st.expander("🔍 Technical Details"):
+                            import traceback
+                            st.code(traceback.format_exc())
     
     # TAB 2: Compare Subdivisions
     with tab2:
