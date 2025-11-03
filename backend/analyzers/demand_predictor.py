@@ -36,7 +36,8 @@ class DemandPredictor:
         subdivision: Optional[str] = None,
         radius_miles: Optional[float] = None,
         center_lat: Optional[float] = None,
-        center_lon: Optional[float] = None
+        center_lon: Optional[float] = None,
+        property_type: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Predict the optimal house configuration for a ZIP code or micro-market.
@@ -50,6 +51,7 @@ class DemandPredictor:
             radius_miles: Optional radius in miles (requires center_lat/center_lon)
             center_lat: Center latitude for radius search
             center_lon: Center longitude for radius search
+            property_type: Optional property type filter ("SFR", "TOWNHOUSE/ROWHOUSE", "CONDOMINIUM", "ALL")
         
         Returns:
             Optimal configuration with supporting data
@@ -79,6 +81,11 @@ class DemandPredictor:
         if radius_miles and center_lat and center_lon and properties:
             properties = self._filter_by_radius(properties, center_lat, center_lon, radius_miles)
             logger.info(f"Filtered to {len(properties)} properties within {radius_miles} miles")
+        
+        # Filter by property type if specified
+        if property_type and property_type != "ALL" and properties:
+            properties = self._filter_by_property_type(properties, property_type)
+            logger.info(f"Filtered to {len(properties)} properties of type {property_type}")
         
         if not properties or len(properties) < min_samples:
             logger.warning(f"Insufficient data for ZIP {zip_code}")
@@ -460,6 +467,31 @@ class DemandPredictor:
             "median_price_per_sqft": statistics.median(price_per_sqft),
             "avg_price_per_sqft": statistics.mean(price_per_sqft)
         }
+    
+    def _filter_by_property_type(
+        self,
+        properties: List[Dict[str, Any]],
+        property_type: str
+    ) -> List[Dict[str, Any]]:
+        """Filter properties by property type."""
+        # Map UI-friendly names to Attom's values
+        type_mapping = {
+            "SFR": "SFR",
+            "Single Family Home": "SFR",
+            "TOWNHOUSE": "TOWNHOUSE/ROWHOUSE",
+            "Townhome": "TOWNHOUSE/ROWHOUSE",
+            "Townhouse": "TOWNHOUSE/ROWHOUSE",
+            "CONDO": "CONDOMINIUM",
+            "Condo": "CONDOMINIUM"
+        }
+        
+        # Get Attom's value
+        attom_value = type_mapping.get(property_type, property_type)
+        
+        return [
+            p for p in properties
+            if attom_value in p.get('summary', {}).get('proptype', '')
+        ]
     
     def _filter_by_subdivision(
         self,

@@ -515,13 +515,21 @@ def show_micro_market_analysis():
     with tab1:
         st.subheader("Analyze Specific Subdivision")
         
-        col1, col2 = st.columns([2, 1])
+        col1, col2, col3 = st.columns([2, 1, 1])
         
         with col1:
             zip_code = st.text_input("ZIP Code", value="27410", key="sub_zip")
         
         with col2:
             months_back = st.selectbox("Historical Period", [6, 12, 24, 36], index=1, key="sub_months")
+        
+        with col3:
+            property_type = st.selectbox(
+                "Property Type",
+                ["ALL", "Single Family Home", "Townhome", "Condo"],
+                index=0,
+                key="sub_property_type"
+            )
         
         # Get available subdivisions button
         if st.button("🔍 Show Available Subdivisions", key="get_subdivs"):
@@ -566,7 +574,8 @@ def show_micro_market_analysis():
                             zip_code,
                             months_back=months_back,
                             min_samples=5,
-                            subdivision=subdivision_filter
+                            subdivision=subdivision_filter,
+                            property_type=property_type
                         )
                         
                         # Run demand prediction
@@ -574,7 +583,8 @@ def show_micro_market_analysis():
                             zip_code,
                             months_back=months_back,
                             min_samples=5,
-                            subdivision=subdivision_filter
+                            subdivision=subdivision_filter,
+                            property_type=property_type
                         )
                         
                         # Check for errors
@@ -713,14 +723,16 @@ def show_micro_market_analysis():
                                 zip_code_compare,
                                 months_back=24,
                                 min_samples=3,
-                                subdivision=subdiv
+                                subdivision=subdiv,
+                                property_type="ALL"  # All property types for comparison
                             )
                             
                             demand_analysis = demand_predictor.predict_optimal_config(
                                 zip_code_compare,
                                 months_back=24,
                                 min_samples=3,
-                                subdivision=subdiv
+                                subdivision=subdiv,
+                                property_type="ALL"  # All property types for comparison
                             )
                             
                             if 'error' not in feature_analysis and 'error' not in demand_analysis:
@@ -785,7 +797,18 @@ def show_micro_market_analysis():
         with col3:
             center_lon = st.number_input("Longitude", value=-79.908, format="%.6f", key="radius_lon")
         
-        radius_miles = st.slider("Radius (miles)", 0.25, 2.0, 0.5, 0.25, key="radius_miles")
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            radius_miles = st.slider("Radius (miles)", 0.25, 2.0, 0.5, 0.25, key="radius_miles")
+        
+        with col2:
+            property_type_radius = st.selectbox(
+                "Property Type",
+                ["ALL", "Single Family Home", "Townhome", "Condo"],
+                index=0,
+                key="radius_property_type"
+            )
         
         st.info("💡 **Tip:** Use Google Maps to find the latitude/longitude of your lot. Right-click on the location and select 'What's here?'")
         
@@ -799,7 +822,8 @@ def show_micro_market_analysis():
                         min_samples=1,  # Lower threshold for radius search
                         radius_miles=radius_miles,
                         center_lat=center_lat,
-                        center_lon=center_lon
+                        center_lon=center_lon,
+                        property_type=property_type_radius
                     )
                     
                     demand_analysis = demand_predictor.predict_optimal_config(
@@ -808,7 +832,8 @@ def show_micro_market_analysis():
                         min_samples=1,  # Lower threshold for radius search
                         radius_miles=radius_miles,
                         center_lat=center_lat,
-                        center_lon=center_lon
+                        center_lon=center_lon,
+                        property_type=property_type_radius
                     )
                     
                     if 'error' in feature_analysis or 'error' in demand_analysis:
