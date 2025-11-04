@@ -49,9 +49,18 @@ def fetch_training_data(
     for zip_code in zip_codes:
         logger.info(f"Fetching data for ZIP {zip_code}...")
         try:
+            # Calculate max_pages - need enough to capture all available data
+            # If there are 2400 sales in 2024 alone, we need ~185 sales/ZIP/year
+            # Over 36 months = ~555 sales/ZIP, so we need at least 6 pages
+            # But to be safe and capture all data, use a much higher limit
+            # Each page has up to 100 properties
+            max_pages_needed = max(
+                (max_properties_per_zip // 100) + 10,  # At least enough for max_properties_per_zip + buffer
+                25  # Minimum 25 pages to capture ~2400 sales/year across all ZIPs
+            )
             properties = attom_client.get_all_sales_paginated(
                 zip_code=zip_code,
-                max_pages=5,  # ~500 properties per ZIP (5 pages * 100)
+                max_pages=max_pages_needed,  # Fetch many pages to get all available data
                 min_sale_date=min_sale_date
             )
             
@@ -101,19 +110,29 @@ def prepare_targets(df: pd.DataFrame, sell_within_days: int = 90) -> tuple:
     # Binary target: sold fast (within threshold) - for demand model classification
     y_sold_fast = (y_dom <= sell_within_days).astype(int)
     
-    # Remove rows with missing targets
+    # Remove rows with missing targets and apply price filter
+    # Filter: $100k - $3M (typical residential property range)
+    MIN_PRICE = 100000  # $100k
+    MAX_PRICE = 3000000  # $3M
     valid_mask = (
         y_price.notna() & 
-        (y_price > 0) & 
+        (y_price >= MIN_PRICE) & 
+        (y_price <= MAX_PRICE) &
         y_dom.notna() & 
         (y_dom >= 0)
     )
+    
+    # Count filtered properties
+    removed_missing = len(df) - valid_mask.sum()
+    removed_low_price = ((y_price < MIN_PRICE) & y_price.notna()).sum()
+    removed_high_price = ((y_price > MAX_PRICE) & y_price.notna()).sum()
     
     y_price = y_price[valid_mask]
     y_sold_fast = y_sold_fast[valid_mask]
     y_dom = y_dom[valid_mask]
     
-    logger.info(f"Valid samples: {len(y_price)} (removed {len(df) - len(y_price)} with missing targets)")
+    logger.info(f"Valid samples: {len(y_price)} (removed {removed_missing} with missing targets)")
+    logger.info(f"Price filter: Removed {removed_low_price} < ${MIN_PRICE:,} and {removed_high_price} > ${MAX_PRICE:,}")
     
     return y_price, y_sold_fast, y_dom, valid_mask
 
@@ -121,6 +140,7 @@ def prepare_targets(df: pd.DataFrame, sell_within_days: int = 90) -> tuple:
 def train_models(
     zip_codes: List[str] = ['27410'],  # Default to Greensboro
     months_back: int = 36,
+    max_properties_per_zip: int = 500,
     hyperparameter_tuning: bool = False,  # Set to False for faster training
     save_models: bool = True,
     model_dir: str = 'models'
@@ -131,6 +151,7 @@ def train_models(
     Args:
         zip_codes: List of ZIP codes to use for training
         months_back: Months of historical data
+        max_properties_per_zip: Maximum properties to fetch per ZIP code
         hyperparameter_tuning: Whether to perform grid search
         save_models: Whether to save trained models
         model_dir: Directory to save models
@@ -143,7 +164,7 @@ def train_models(
     logger.info("="*80)
     
     # 1. Fetch training data
-    df = fetch_training_data(zip_codes, months_back=months_back)
+    df = fetch_training_data(zip_codes, months_back=months_back, max_properties_per_zip=max_properties_per_zip)
     
     if df.empty or len(df) < 50:
         raise ValueError(f"Insufficient training data: {len(df)} samples. Need at least 50.")

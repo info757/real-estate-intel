@@ -256,6 +256,13 @@ class RecommendationEngine:
         # Get top N
         top_recommendations = filtered_results[:top_n]
         
+        # Debug: Log unique configurations to verify they're different
+        if top_recommendations:
+            logger.info(f"Top {len(top_recommendations)} recommendations:")
+            for i, rec in enumerate(top_recommendations, 1):
+                config = rec.get('configuration', {})
+                logger.info(f"  {i}. {config.get('beds', '?')}BR/{config.get('baths', '?')}BA, {config.get('sqft', '?')} sqft - Price: ${rec.get('predicted_price', 0):,.0f}, Margin: {rec.get('margin', {}).get('gross_margin_pct', 0):.1f}%")
+        
         # Generate explanations for top recommendations
         for rec in top_recommendations:
             rec['explanation'] = self._generate_explanation(rec, filtered_results)
@@ -421,8 +428,10 @@ class RecommendationEngine:
                 margin_pct=margin['gross_margin_pct']
             )
             
+            # Create a completely new dictionary with all values copied (deep copy for nested structures)
+            import copy
             return {
-                'configuration': config,
+                'configuration': copy.deepcopy(config),  # Deep copy config dict
                 'predicted_price': float(predicted_price),
                 'demand': {
                     'sell_probability': float(sell_probability),
@@ -439,8 +448,8 @@ class RecommendationEngine:
                         'location_adjustment': float(cost_breakdown.location_adjustment),
                     }
                 },
-                'margin': margin,
-                'risk_score': risk_score,
+                'margin': copy.deepcopy(margin),  # Deep copy margin dict to avoid any reference issues
+                'risk_score': float(risk_score),
                 'passes_constraints': (
                     sell_probability >= self.min_sell_probability and
                     expected_dom <= self.max_dom and

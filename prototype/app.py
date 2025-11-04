@@ -1187,43 +1187,81 @@ def show_ml_recommendations():
                 else:
                     st.success(f"✅ Generated {len(results['recommendations'])} recommendations from {results['total_evaluated']} evaluated configurations")
                     
+                    # Debug: Show raw data to verify it's different
+                    with st.expander("🔍 Debug: Raw Recommendation Data", expanded=False):
+                        for idx, rec in enumerate(results['recommendations'], 1):
+                            st.json({
+                                'rec_num': idx,
+                                'config': rec.get('configuration', {}),
+                                'predicted_price': rec.get('predicted_price'),
+                                'margin': rec.get('margin', {}),
+                                'demand': rec.get('demand', {}),
+                                'risk_score': rec.get('risk_score')
+                            })
+                    
                     # Display recommendations
                     for i, rec in enumerate(results['recommendations'], 1):
-                        with st.expander(f"🥇 Recommendation #{i}: {rec['configuration']['beds']}BR/{rec['configuration']['baths']}BA, {rec['configuration']['sqft']:,} sqft", expanded=(i==1)):
+                        # Extract ALL values at the start of each iteration to avoid any reference issues
+                        # Create unique copies to ensure no reference sharing
+                        import copy
+                        rec_copy = copy.deepcopy(rec)
+                        
+                        config = rec_copy.get('configuration', {})
+                        rec_predicted_price = float(rec_copy.get('predicted_price', 0))
+                        rec_margin = rec_copy.get('margin', {})
+                        rec_cost = rec_copy.get('cost', {})
+                        rec_demand = rec_copy.get('demand', {})
+                        rec_risk_score = float(rec_copy.get('risk_score', 0))
+                        
+                        # Extract margin values - ensure we get fresh values
+                        margin_predicted_price = float(rec_margin.get('predicted_price', rec_predicted_price))
+                        margin_construction_cost = float(rec_margin.get('construction_cost', rec_cost.get('construction_cost', 0)))
+                        margin_sga_cost = float(rec_margin.get('sga_cost', 0))
+                        margin_gross_margin = float(rec_margin.get('gross_margin', 0))
+                        margin_gross_margin_pct = float(rec_margin.get('gross_margin_pct', 0))
+                        margin_roi = float(rec_margin.get('roi', 0))
+                        
+                        # Extract demand values - ensure we get fresh values
+                        demand_sell_probability = float(rec_demand.get('sell_probability', 0))
+                        demand_expected_dom = float(rec_demand.get('expected_dom', 0))
+                        demand_meets_threshold = bool(rec_demand.get('meets_demand_threshold', False))
+                        
+                        # Debug: Show in UI (visible to user)
+                        debug_key = f"rec_{i}_debug"
+                        with st.expander(f"🥇 Recommendation #{i}: {config.get('beds', '?')}BR/{config.get('baths', '?')}BA, {config.get('sqft', 0):,} sqft", expanded=(i==1)):
                             col1, col2 = st.columns([2, 1])
                             
                             with col1:
                                 st.markdown("**Configuration:**")
-                                st.write(f"**Bedrooms:** {rec['configuration']['beds']}")
-                                st.write(f"**Bathrooms:** {rec['configuration']['baths']}")
-                                st.write(f"**Square Feet:** {rec['configuration']['sqft']:,}")
-                                st.write(f"**Finish Level:** {rec['configuration']['finish_level'].title()}")
-                                st.write(f"**Stories:** {rec['configuration']['stories']}")
-                                st.write(f"**Garage Spaces:** {rec['configuration']['garage_spaces']}")
+                                st.write(f"**Bedrooms:** {config.get('beds', '?')}")
+                                st.write(f"**Bathrooms:** {config.get('baths', '?')}")
+                                st.write(f"**Square Feet:** {config.get('sqft', 0):,}")
+                                st.write(f"**Finish Level:** {config.get('finish_level', 'unknown').title()}")
+                                st.write(f"**Stories:** {config.get('stories', '?')}")
+                                st.write(f"**Garage Spaces:** {config.get('garage_spaces', '?')}")
                                 
                                 st.markdown("---")
                                 st.markdown("**Financial Projections:**")
-                                margin = rec['margin']
-                                st.metric("Predicted Sale Price", f"${margin['predicted_price']:,.0f}")
-                                st.metric("Construction Cost", f"${margin['construction_cost']:,.0f}")
-                                st.metric("SG&A Cost", f"${margin['sga_cost']:,.0f}")
-                                st.metric("**Gross Margin**", f"${margin['gross_margin']:,.0f}", f"{margin['gross_margin_pct']:.1f}%")
-                                st.metric("ROI", f"{margin['roi']:.1f}%")
+                                # Use extracted values
+                                st.metric("Predicted Sale Price", f"${rec_predicted_price:,.0f}")
+                                st.metric("Construction Cost", f"${margin_construction_cost:,.0f}")
+                                st.metric("SG&A Cost", f"${margin_sga_cost:,.0f}")
+                                st.metric("**Gross Margin**", f"${margin_gross_margin:,.0f}", f"{margin_gross_margin_pct:.1f}%")
+                                st.metric("ROI", f"{margin_roi:.1f}%")
                             
                             with col2:
                                 st.markdown("**Demand Forecast:**")
-                                demand = rec['demand']
-                                st.metric("Sell Probability", f"{demand['sell_probability']*100:.0f}%")
-                                st.metric("Expected DOM", f"{demand['expected_dom']:.0f} days")
+                                st.metric("Sell Probability", f"{demand_sell_probability*100:.0f}%")
+                                st.metric("Expected DOM", f"{demand_expected_dom:.0f} days")
                                 
-                                if demand['meets_demand_threshold']:
+                                if demand_meets_threshold:
                                     st.success("✅ Meets demand threshold")
                                 else:
                                     st.warning("⚠️ Below demand threshold")
                                 
                                 st.markdown("---")
                                 st.markdown("**Risk Score:**")
-                                st.metric("Risk", f"{rec['risk_score']:.2f}", help="Lower is better (0-1 scale)")
+                                st.metric("Risk", f"{rec_risk_score:.2f}", help="Lower is better (0-1 scale)")
                                 
                                 # Confidence assessment
                                 if models_trained:

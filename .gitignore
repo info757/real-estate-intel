@@ -92,3 +92,6 @@ frontend/.next/
 *.seed
 *.pid.lock
 
+
+# API Cache - Do not commit cached API responses
+cache/

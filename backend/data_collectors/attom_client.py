@@ -356,28 +356,40 @@ class AttomDataClient:
             result = self.get_sales_history(zip_code, page=page, page_size=100)
             
             if not result or 'property' not in result:
+                logger.info(f"Stopping at page {page}: No result or no property key")
                 break
             
-            properties = result['property']
+            raw_properties = result['property']
+            
+            # If API returns no properties (before filtering), we've reached the end
+            if len(raw_properties) == 0:
+                logger.info(f"Stopping at page {page}: API returned empty page")
+                break
             
             # Client-side date filtering if needed
             if min_sale_date:
                 properties = [
-                    p for p in properties
+                    p for p in raw_properties
                     if p.get('sale', {}).get('saleTransDate', '') >= min_sale_date
                 ]
+            else:
+                properties = raw_properties
             
             all_properties.extend(properties)
             
-            # Check if we've reached the last page
+            # Check if we've reached the last page based on API's total count
             status = result.get('status', {})
             total = status.get('total', 0)
+            raw_count = len(raw_properties)
             current_count = len(all_properties)
             
-            if current_count >= total or len(properties) == 0:
+            # Stop if we've fetched all available properties from API (before filtering)
+            # Don't stop just because filtered results are empty - more pages might have matches
+            if total > 0 and (page * 100) >= total:
+                logger.info(f"Reached end: page {page} * 100 >= total {total}")
                 break
-                
-            logger.info(f"Fetched page {page}, total properties: {current_count}/{total}")
+            
+            logger.info(f"Fetched page {page}: {raw_count} raw properties, {len(properties)} after date filter, {current_count} total collected")
         
         return all_properties
     
