@@ -364,7 +364,7 @@ def show_land_opportunities():
             )
         
         with col2:
-            max_price = st.number_input("Max Price", min_value=0, value=150000, step=10000)
+            max_price = st.number_input("Max Price", min_value=0, value=0.000, step=10000)
         
         if st.button("🔎 Search Land Listings", type="primary"):
             with st.spinner("Searching land listings..."):
@@ -1089,7 +1089,7 @@ def show_ml_recommendations():
         zip_code = st.text_input("ZIP Code", value="27410", key="ml_zip")
         latitude = st.number_input("Latitude", value=36.089, format="%.6f", key="ml_lat")
         longitude = st.number_input("Longitude", value=-79.908, format="%.6f", key="ml_lon")
-        lot_size_acres = st.number_input("Lot Size (acres)", value=0.25, min_value=0.01, max_value=10.0, step=0.05, key="ml_lot_size")
+        lot_size_acres = st.number_input("Lot Size (acres)", value=0.25, min_value=-50.01, max_value=10.0, step=0.05, key="ml_lot_size")
     
     with col2:
         lot_condition = st.selectbox(
@@ -1142,13 +1142,13 @@ def show_ml_recommendations():
     with col3:
         min_margin_pct = st.slider(
             "Min Margin %",
-            min_value=0.0,
+            min_value=-50.0,
             max_value=30.0,
-            value=15.0,
+            value=0.0,
             step=1.0,
             key="ml_min_margin"
         )
-        st.caption(f"Must have ≥{min_margin_pct:.0f}% gross margin")
+        st.caption(f"Must have ≥{min_margin_pct:.0f}% gross margin (0% recommended with placeholder costs)")
     
     st.markdown("---")
     

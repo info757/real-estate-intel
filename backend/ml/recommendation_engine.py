@@ -37,7 +37,7 @@ class RecommendationEngine:
         self,
         min_sell_probability: float = 0.70,  # Must have ≥70% chance to sell within threshold
         max_dom: int = 90,  # Maximum acceptable days on market
-        min_margin_pct: float = 15.0,  # Minimum 15% gross margin
+        min_margin_pct: float = 0.0,  # Minimum margin % (0% default to allow placeholder costs)
         sga_allocation: float = 0.10  # 10% of price for SG&A
     ):
         """
