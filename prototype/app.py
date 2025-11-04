@@ -5,6 +5,7 @@ Rapid prototype for client demos with dashboard, analysis, and AI chat.
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
@@ -23,6 +24,9 @@ from backend.analyzers.financial_optimizer import FinancialOptimizer
 from backend.ai_engine.rag_system import QdrantRAGSystem
 from backend.analyzers.feature_analyzer import feature_analyzer
 from backend.analyzers.demand_predictor import demand_predictor
+from backend.ml.recommendation_engine import recommendation_engine
+from backend.ml.guardrails import guardrails
+from backend.ml.backtesting import backtester
 from config.settings import settings
 
 # Page config
@@ -102,12 +106,12 @@ def main():
         st.markdown("### 🏘️ RE Intel")
         st.markdown("---")
         
-        page = st.radio(
-            "Navigation",
-            ["🏠 Dashboard", "📊 Market Analysis", "🎯 Micro-Market Analysis",
-             "🏞️ Land Opportunities", "🏗️ Product Intelligence", 
-             "💰 Financial Modeling", "🤖 AI Assistant"]
-        )
+                    page = st.radio(
+                "Navigation",
+                ["🏠 Dashboard", "📊 Market Analysis", "🎯 Micro-Market Analysis",
+                 "🏞️ Land Opportunities", "🏗️ Product Intelligence", 
+                 "💰 Financial Modeling", "🧠 ML Recommendations", "🤖 AI Assistant"]
+            )
         
         st.markdown("---")
         st.markdown("### Settings")
@@ -134,6 +138,8 @@ def main():
         show_product_intelligence()
     elif page == "💰 Financial Modeling":
         show_financial_modeling()
+    elif page == "🧠 ML Recommendations":
+        show_ml_recommendations()
     elif page == "🤖 AI Assistant":
         show_ai_assistant()
 
@@ -1038,6 +1044,238 @@ def show_ai_assistant():
                 error_msg = f"Error: {str(e)}"
                 st.session_state.chat_history.append({'role': 'assistant', 'content': error_msg})
                 st.chat_message("assistant").error(error_msg)
+
+
+def show_ml_recommendations():
+    """Show ML-based build recommendations."""
+    st.header("🧠 ML-Powered Build Recommendations")
+    
+    st.markdown("""
+    **AI-driven recommendations:** Get data-driven recommendations for what to build on a specific lot.
+    
+    The system evaluates multiple configurations, predicts prices and demand, estimates costs,
+    and ranks options by margin while ensuring they meet demand thresholds.
+    """)
+    
+    # Check if models are trained
+    models_trained = False
+    try:
+        # Try to load models (will raise exception if not trained)
+        from backend.ml.pricing_model import pricing_model
+        from backend.ml.demand_model import demand_model
+        
+        # Check if models exist
+        import os
+        model_dir = "models"
+        pricing_exists = os.path.exists(f"{model_dir}/pricing_model.pkl")
+        demand_exists = os.path.exists(f"{model_dir}/demand_model_probability.pkl")
+        
+        if pricing_exists and demand_exists:
+            models_trained = True
+            st.success("✅ ML models loaded successfully!")
+        else:
+            st.warning("⚠️ **Models not trained yet.** Train models using: `python backend/ml/train_models.py`")
+            st.info("💡 The recommendation engine will work, but predictions may be less accurate without trained models.")
+    except Exception as e:
+        st.warning(f"⚠️ **Models not available:** {str(e)}")
+    
+    # Lot input form
+    st.markdown("---")
+    st.subheader("📍 Lot Information")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        zip_code = st.text_input("ZIP Code", value="27410", key="ml_zip")
+        latitude = st.number_input("Latitude", value=36.089, format="%.6f", key="ml_lat")
+        longitude = st.number_input("Longitude", value=-79.908, format="%.6f", key="ml_lon")
+        lot_size_acres = st.number_input("Lot Size (acres)", value=0.25, min_value=0.01, max_value=10.0, step=0.05, key="ml_lot_size")
+    
+    with col2:
+        lot_condition = st.selectbox(
+            "Lot Condition",
+            ["flat", "gentle_slope", "moderate_slope", "steep_slope", "very_steep"],
+            index=0,
+            key="ml_lot_condition"
+        )
+        utilities_status = st.selectbox(
+            "Utilities Status",
+            ["all_utilities", "no_sewer", "no_water", "no_sewer_no_water", "no_electric"],
+            index=0,
+            key="ml_utilities"
+        )
+        property_type = st.selectbox(
+            "Property Type",
+            ["Single Family Home", "Townhome", "Condo"],
+            index=0,
+            key="ml_property_type"
+        )
+        subdivision = st.text_input("Subdivision (optional)", value="", key="ml_subdivision")
+    
+    st.markdown("---")
+    st.subheader("⚙️ Recommendation Settings")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        min_sell_probability = st.slider(
+            "Min Sell Probability",
+            min_value=0.50,
+            max_value=0.95,
+            value=0.70,
+            step=0.05,
+            key="ml_min_prob"
+        )
+        st.caption(f"Must have ≥{min_sell_probability*100:.0f}% chance to sell")
+    
+    with col2:
+        max_dom = st.slider(
+            "Max Days on Market",
+            min_value=30,
+            max_value=180,
+            value=90,
+            step=10,
+            key="ml_max_dom"
+        )
+        st.caption(f"Must sell within {max_dom} days")
+    
+    with col3:
+        min_margin_pct = st.slider(
+            "Min Margin %",
+            min_value=0.0,
+            max_value=30.0,
+            value=15.0,
+            step=1.0,
+            key="ml_min_margin"
+        )
+        st.caption(f"Must have ≥{min_margin_pct:.0f}% gross margin")
+    
+    st.markdown("---")
+    
+    # Generate recommendations button
+    if st.button("🚀 Generate Recommendations", type="primary", key="ml_generate"):
+        with st.spinner("Generating recommendations... This may take a minute."):
+            try:
+                # Prepare lot features
+                lot_features = {
+                    'zip_code': zip_code,
+                    'latitude': latitude,
+                    'longitude': longitude,
+                    'lot_size_acres': lot_size_acres,
+                    'lot_condition': lot_condition,
+                    'utilities_status': utilities_status,
+                }
+                
+                if subdivision:
+                    lot_features['subdivision'] = subdivision
+                
+                # Update recommendation engine settings
+                recommendation_engine.min_sell_probability = min_sell_probability
+                recommendation_engine.max_dom = max_dom
+                recommendation_engine.min_margin_pct = min_margin_pct
+                
+                # Generate recommendations
+                results = recommendation_engine.generate_recommendations(
+                    lot_features=lot_features,
+                    property_type=property_type,
+                    top_n=5
+                )
+                
+                if 'error' in results:
+                    st.error(f"❌ Error: {results['error']}")
+                    st.info("💡 Make sure the models are trained and the lot information is valid.")
+                else:
+                    st.success(f"✅ Generated {len(results['recommendations'])} recommendations from {results['total_evaluated']} evaluated configurations")
+                    
+                    # Display recommendations
+                    for i, rec in enumerate(results['recommendations'], 1):
+                        with st.expander(f"🥇 Recommendation #{i}: {rec['configuration']['beds']}BR/{rec['configuration']['baths']}BA, {rec['configuration']['sqft']:,} sqft", expanded=(i==1)):
+                            col1, col2 = st.columns([2, 1])
+                            
+                            with col1:
+                                st.markdown("**Configuration:**")
+                                st.write(f"**Bedrooms:** {rec['configuration']['beds']}")
+                                st.write(f"**Bathrooms:** {rec['configuration']['baths']}")
+                                st.write(f"**Square Feet:** {rec['configuration']['sqft']:,}")
+                                st.write(f"**Finish Level:** {rec['configuration']['finish_level'].title()}")
+                                st.write(f"**Stories:** {rec['configuration']['stories']}")
+                                st.write(f"**Garage Spaces:** {rec['configuration']['garage_spaces']}")
+                                
+                                st.markdown("---")
+                                st.markdown("**Financial Projections:**")
+                                margin = rec['margin']
+                                st.metric("Predicted Sale Price", f"${margin['predicted_price']:,.0f}")
+                                st.metric("Construction Cost", f"${margin['construction_cost']:,.0f}")
+                                st.metric("SG&A Cost", f"${margin['sga_cost']:,.0f}")
+                                st.metric("**Gross Margin**", f"${margin['gross_margin']:,.0f}", f"{margin['gross_margin_pct']:.1f}%")
+                                st.metric("ROI", f"{margin['roi']:.1f}%")
+                            
+                            with col2:
+                                st.markdown("**Demand Forecast:**")
+                                demand = rec['demand']
+                                st.metric("Sell Probability", f"{demand['sell_probability']*100:.0f}%")
+                                st.metric("Expected DOM", f"{demand['expected_dom']:.0f} days")
+                                
+                                if demand['meets_demand_threshold']:
+                                    st.success("✅ Meets demand threshold")
+                                else:
+                                    st.warning("⚠️ Below demand threshold")
+                                
+                                st.markdown("---")
+                                st.markdown("**Risk Score:**")
+                                st.metric("Risk", f"{rec['risk_score']:.2f}", help="Lower is better (0-1 scale)")
+                                
+                                # Confidence assessment
+                                if models_trained:
+                                    try:
+                                        confidence = guardrails.assess_recommendation_confidence(
+                                            rec,
+                                            n_training_samples=100  # Would need actual count
+                                        )
+                                        
+                                        conf_level = confidence['overall_confidence']
+                                        if conf_level == 'HIGH':
+                                            st.success(f"✅ {conf_level} CONFIDENCE")
+                                        elif conf_level == 'MEDIUM':
+                                            st.warning(f"⚡ {conf_level} CONFIDENCE")
+                                        else:
+                                            st.error(f"⚠️ {conf_level} CONFIDENCE")
+                                        
+                                        if confidence['all_warnings']:
+                                            with st.expander("Warnings"):
+                                                for warning in confidence['all_warnings']:
+                                                    st.warning(warning)
+                                    except Exception as e:
+                                        st.info("Confidence assessment unavailable")
+                            
+                            st.markdown("---")
+                            st.markdown("**Explanation:**")
+                            st.info(rec.get('explanation', 'No explanation available'))
+                    
+                    # Summary statistics
+                    st.markdown("---")
+                    st.subheader("📊 Summary Statistics")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Configurations Evaluated", results['total_evaluated'])
+                    with col2:
+                        st.metric("Passing Constraints", results['total_passing_constraints'])
+                    with col3:
+                        avg_margin = np.mean([r['margin']['gross_margin_pct'] for r in results['recommendations']])
+                        st.metric("Avg Margin", f"{avg_margin:.1f}%")
+                    with col4:
+                        avg_prob = np.mean([r['demand']['sell_probability'] for r in results['recommendations']])
+                        st.metric("Avg Sell Probability", f"{avg_prob*100:.0f}%")
+                    
+            except Exception as e:
+                st.error(f"❌ Error generating recommendations: {str(e)}")
+                with st.expander("Technical Details"):
+                    import traceback
+                    st.code(traceback.format_exc())
+                
+                st.info("💡 **Tips:**\n- Make sure models are trained: `python backend/ml/train_models.py`\n- Verify lot information is correct\n- Try adjusting the constraints")
 
 
 if __name__ == "__main__":
