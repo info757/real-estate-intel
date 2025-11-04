@@ -106,12 +106,12 @@ def main():
         st.markdown("### 🏘️ RE Intel")
         st.markdown("---")
         
-                    page = st.radio(
-                "Navigation",
-                ["🏠 Dashboard", "📊 Market Analysis", "🎯 Micro-Market Analysis",
-                 "🏞️ Land Opportunities", "🏗️ Product Intelligence", 
-                 "💰 Financial Modeling", "🧠 ML Recommendations", "🤖 AI Assistant"]
-            )
+        page = st.radio(
+            "Navigation",
+            ["🏠 Dashboard", "📊 Market Analysis", "🎯 Micro-Market Analysis",
+             "🏞️ Land Opportunities", "🏗️ Product Intelligence", 
+             "💰 Financial Modeling", "🧠 ML Recommendations", "🤖 AI Assistant"]
+        )
         
         st.markdown("---")
         st.markdown("### Settings")
