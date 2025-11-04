@@ -573,7 +573,7 @@ def show_micro_market_analysis():
                         feature_analysis = feature_analyzer.analyze_feature_impact(
                             zip_code,
                             months_back=months_back,
-                            min_samples=5,
+                            min_samples=3,  # Lower threshold to allow more configs
                             subdivision=subdivision_filter,
                             property_type=property_type
                         )
@@ -582,7 +582,7 @@ def show_micro_market_analysis():
                         demand_analysis = demand_predictor.predict_optimal_config(
                             zip_code,
                             months_back=months_back,
-                            min_samples=5,
+                            min_samples=3,  # Lower threshold to allow more configs
                             subdivision=subdivision_filter,
                             property_type=property_type
                         )
@@ -590,9 +590,19 @@ def show_micro_market_analysis():
                         # Check for errors
                         if 'error' in feature_analysis or 'error' in demand_analysis:
                             st.error(f"Insufficient data for {subdiv_name}. Try selecting a different subdivision or increase the historical period.")
+                        elif 'optimal_config' not in demand_analysis or not demand_analysis.get('optimal_config'):
+                            # This shouldn't happen, but let's handle it
+                            st.warning(f"⚠️ Found {feature_analysis.get('property_count', 0)} properties but couldn't generate recommendation.")
+                            with st.expander("Debug Info"):
+                                st.json({"demand_keys": list(demand_analysis.keys()), "has_optimal": 'optimal_config' in demand_analysis})
                         else:
                             # Display results
                             st.success("✅ Analysis complete!")
+                            
+                            # Debug: Show what we got
+                            with st.expander("🔍 Debug Info", expanded=False):
+                                st.json({"optimal_config_type": type(demand_analysis.get('optimal_config')).__name__, 
+                                        "optimal_config_keys": list(demand_analysis.get('optimal_config', {}).keys()) if isinstance(demand_analysis.get('optimal_config'), dict) else "Not a dict"})
                             
                             # Market Overview
                             st.markdown("---")
