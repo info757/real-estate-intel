@@ -86,6 +86,119 @@ class RecommendationEngine:
             Dictionary with recommendations and metadata
         """
         logger.info(f"Generating recommendations for lot in {lot_features.get('zip_code', 'unknown ZIP')}")
+        print(f"[DEBUG] Starting recommendation generation for ZIP {lot_features.get('zip_code', 'unknown')}")  # Visible in Streamlit
+        
+        # Check if model files exist - use absolute path relative to project root
+        import os
+        from pathlib import Path
+        
+        # Get the project root (assuming this file is in backend/ml/)
+        current_file = Path(__file__).resolve()
+        project_root = current_file.parent.parent.parent  # Go up from backend/ml/ to project root
+        model_dir = project_root / "models"
+        pricing_model_path = model_dir / "pricing_model.pkl"
+        demand_model_path = model_dir / "demand_model_probability.pkl"
+        
+        print(f"[DEBUG] Project root: {project_root}")
+        print(f"[DEBUG] Model directory: {model_dir}")
+        print(f"[DEBUG] Current working directory: {os.getcwd()}")
+        
+        pricing_exists = pricing_model_path.exists()
+        demand_exists = demand_model_path.exists()
+        
+        print(f"[DEBUG] Pricing model file exists: {pricing_exists} at {pricing_model_path}")
+        print(f"[DEBUG] Demand model file exists: {demand_exists} at {demand_model_path}")
+        
+        if not pricing_exists or not demand_exists:
+            missing = []
+            if not pricing_exists:
+                missing.append(f"pricing model ({pricing_model_path})")
+            if not demand_exists:
+                missing.append(f"demand model ({demand_model_path})")
+            error_msg = f'Model files not found: {", ".join(missing)}. Please train models first using: python backend/ml/train_models.py'
+            print(f"[DEBUG] ERROR: {error_msg}")
+            logger.error(error_msg)
+            return {
+                'error': error_msg,
+                'recommendations': [],
+                'total_evaluated': 0
+            }
+        
+        # Update model_dir on singleton instances to use Path object (not string)
+        pricing_model.model_dir = model_dir
+        demand_model.model_dir = model_dir
+        
+        # Try to load models if they exist but aren't loaded
+        try:
+            if pricing_model.model is None:
+                try:
+                    print("[DEBUG] Loading pricing model...")
+                    pricing_model.load()
+                    logger.info("Loaded pricing model from disk")
+                    print("[DEBUG] Pricing model loaded successfully")
+                except Exception as e:
+                    error_msg = f"Could not load pricing model: {e}"
+                    logger.error(error_msg)
+                    print(f"[DEBUG] ERROR: {error_msg}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    return {
+                        'error': f'Failed to load pricing model: {str(e)}. Please check model file.',
+                        'recommendations': [],
+                        'total_evaluated': 0
+                    }
+            
+            if demand_model.sell_probability_model is None or demand_model.dom_model is None:
+                try:
+                    print("[DEBUG] Loading demand model...")
+                    demand_model.load()
+                    logger.info("Loaded demand model from disk")
+                    print("[DEBUG] Demand model loaded successfully")
+                except Exception as e:
+                    error_msg = f"Could not load demand model: {e}"
+                    logger.error(error_msg)
+                    print(f"[DEBUG] ERROR: {error_msg}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    return {
+                        'error': f'Failed to load demand model: {str(e)}. Please check model file.',
+                        'recommendations': [],
+                        'total_evaluated': 0
+                    }
+        except Exception as e:
+            error_msg = f"Error loading models: {e}"
+            logger.error(error_msg)
+            print(f"[DEBUG] ERROR: {error_msg}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                'error': f'Error loading models: {str(e)}',
+                'recommendations': [],
+                'total_evaluated': 0
+            }
+        
+        # Check if models are loaded
+        if pricing_model.model is None:
+            error_msg = 'Pricing model not loaded. Model file exists but failed to load.'
+            print(f"[DEBUG] ERROR: {error_msg}")
+            logger.error(error_msg)
+            return {
+                'error': error_msg,
+                'recommendations': [],
+                'total_evaluated': 0
+            }
+        
+        if demand_model.sell_probability_model is None or demand_model.dom_model is None:
+            error_msg = 'Demand model not loaded. Model file exists but failed to load.'
+            print(f"[DEBUG] ERROR: {error_msg}")
+            logger.error(error_msg)
+            return {
+                'error': error_msg,
+                'recommendations': [],
+                'total_evaluated': 0
+            }
+        
+        print("[DEBUG] Models loaded successfully, generating candidate configurations...")
         
         # Generate candidate configurations if not provided
         if candidate_configs is None:
@@ -95,7 +208,8 @@ class RecommendationEngine:
         
         # Evaluate each configuration
         results = []
-        for config in candidate_configs:
+        evaluation_errors = []
+        for i, config in enumerate(candidate_configs):
             try:
                 evaluation = self._evaluate_configuration(
                     config=config,
@@ -107,15 +221,30 @@ class RecommendationEngine:
                 
                 if evaluation:
                     results.append(evaluation)
+                else:
+                    # Log first few failures for debugging
+                    if len(evaluation_errors) < 3:
+                        evaluation_errors.append(f"Config {i+1}: {config.get('beds', '?')}BR/{config.get('baths', '?')}BA - evaluation returned None")
             except Exception as e:
-                logger.warning(f"Error evaluating config {config}: {e}")
+                error_msg = f"Config {i+1}: {config.get('beds', '?')}BR/{config.get('baths', '?')}BA - {str(e)}"
+                logger.warning(f"Error evaluating {error_msg}")
+                if len(evaluation_errors) < 3:
+                    evaluation_errors.append(error_msg)
                 continue
         
+        logger.info(f"Successfully evaluated {len(results)} configurations out of {len(candidate_configs)} candidates")
+        
         if not results:
+            error_msg = f'No valid configurations evaluated after trying {len(candidate_configs)} candidates.'
+            if evaluation_errors:
+                error_msg += f' Sample errors: {"; ".join(evaluation_errors)}'
+            else:
+                error_msg += ' All evaluations returned None - check logs for details.'
             return {
-                'error': 'No valid configurations evaluated',
+                'error': error_msg,
                 'recommendations': [],
-                'total_evaluated': 0
+                'total_evaluated': len(candidate_configs),
+                'successful_evaluations': 0
             }
         
         # Filter by constraints
@@ -231,15 +360,37 @@ class RecommendationEngine:
             Evaluation dictionary or None if evaluation fails
         """
         try:
+            # Ensure models are loaded before prediction
+            if pricing_model.model is None:
+                try:
+                    pricing_model.load()
+                    logger.debug("Loaded pricing model in _evaluate_configuration")
+                except Exception as e:
+                    logger.error(f"Failed to load pricing model: {e}")
+                    return None
+            
+            if demand_model.sell_probability_model is None or demand_model.dom_model is None:
+                try:
+                    demand_model.load()
+                    logger.debug("Loaded demand model in _evaluate_configuration")
+                except Exception as e:
+                    logger.error(f"Failed to load demand model: {e}")
+                    return None
+            
             # 1. Create feature vector for ML models
+            # Ensure property_type is in lot_features for feature vector creation
+            lot_features_with_type = lot_features.copy()
+            lot_features_with_type['property_type'] = property_type
+            
             feature_vector = self._create_feature_vector(
                 config=config,
-                lot_features=lot_features,
+                lot_features=lot_features_with_type,
                 historical_data=historical_data,
                 current_listings_context=current_listings_context
             )
             
             if feature_vector is None or feature_vector.empty:
+                logger.warning(f"Feature vector is None or empty for config {config}")
                 return None
             
             # 2. Predict price
@@ -309,60 +460,140 @@ class RecommendationEngine:
         current_listings_context: Optional[Dict[str, Any]] = None
     ) -> Optional[pd.DataFrame]:
         """
-        Create feature vector for ML models.
-        
-        This is a simplified version - in production, this would use
-        the full feature_engineering module with proper data transformation.
+        Create feature vector for ML models with all required features.
         """
         try:
-            # Create a minimal feature vector from config and lot features
-            # In production, we'd use feature_engineer.create_features() with proper data
+            import pandas as pd
+            import numpy as np
+            from datetime import datetime
             
-            # Basic features
+            # Basic features from config
+            beds = config.get('beds', config.get('bedrooms', 3))
+            baths = config.get('baths', config.get('bathrooms', 2.5))
+            sqft = config.get('sqft', config.get('square_feet', 2000))
+            lot_size_acres = lot_features.get('lot_size_acres', 0.25)
+            lot_size_sqft = lot_size_acres * 43560  # Convert acres to sqft
+            year_built = 2024  # New construction
+            stories = config.get('stories', 1 if sqft < 2000 else 2)
+            latitude = lot_features.get('latitude', 36.089)
+            longitude = lot_features.get('longitude', -79.908)
+            subdivision = lot_features.get('subdivision', '')
+            property_type = lot_features.get('property_type', config.get('property_type', 'Single Family Home'))
+            
+            # Calculate market-based features from historical data if available
+            # These are needed for price_per_sqft, price_per_bedroom, etc.
+            market_price_per_sqft = 150.0  # Default fallback
+            if historical_data:
+                try:
+                    from backend.ml.feature_engineering import feature_engineer
+                    # Create a temporary DataFrame from historical data to calculate market stats
+                    hist_df = feature_engineer.engineer_features(historical_data)
+                    if not hist_df.empty and 'price_per_sqft' in hist_df.columns:
+                        market_price_per_sqft = hist_df['price_per_sqft'].median()
+                        if pd.isna(market_price_per_sqft) or market_price_per_sqft <= 0:
+                            market_price_per_sqft = 150.0
+                except Exception as e:
+                    logger.warning(f"Could not calculate market stats from historical data: {e}")
+            
+            # Calculate subdivision size (number of properties in subdivision)
+            subdivision_size = 50  # Default
+            if historical_data and subdivision:
+                try:
+                    subdivision_size = len([p for p in historical_data 
+                                          if self._safe_get(p, ['area', 'subdname']) == subdivision])
+                    subdivision_size = max(subdivision_size, 10)  # Minimum 10
+                except:
+                    subdivision_size = 50
+            
+            # Finish level to quality score mapping
+            finish_scores = {'starter': 4, 'standard': 5, 'premium': 7, 'luxury': 9}
+            quality_score = finish_scores.get(config.get('finish_level', 'standard'), 5)
+            
+            # Property type indicators
+            is_sfr = 1 if 'single' in property_type.lower() or property_type == 'SFR' else 0
+            is_townhome = 1 if 'town' in property_type.lower() or 'townhouse' in property_type.lower() else 0
+            is_condo = 1 if 'condo' in property_type.lower() else 0
+            
+            # Temporal features (using current date for new construction)
+            now = datetime.now()
+            age_years = 0  # New construction
+            sale_year = now.year
+            sale_month = now.month
+            sale_quarter = (sale_month - 1) // 3 + 1
+            is_spring_summer = 1 if sale_month in [3, 4, 5, 6, 7, 8] else 0
+            days_since_sale = 0  # New construction, not sold yet
+            
+            # Calculate derived features
+            price_per_sqft = market_price_per_sqft  # Will be adjusted by model, but need base value
+            price_per_bedroom = price_per_sqft * sqft / beds if beds > 0 else 0
+            price_per_bathroom = price_per_sqft * sqft / baths if baths > 0 else 0
+            lot_coverage_ratio = sqft / lot_size_sqft if lot_size_sqft > 0 else 0
+            beds_per_1000sqft = (beds / sqft) * 1000 if sqft > 0 else 0
+            bath_bed_ratio = baths / beds if beds > 0 else 0
+            condition_score = 5  # New construction = good condition
+            overall_quality = quality_score  # Use quality_score as overall_quality
+            
+            # Create feature dictionary with ALL required features
             features = {
-                'beds': config.get('beds', config.get('bedrooms', 3)),
-                'baths': config.get('baths', config.get('bathrooms', 2.5)),
-                'sqft': config.get('sqft', config.get('square_feet', 2000)),
-                'lot_size_acres': lot_features.get('lot_size_acres', 0.25),
-                'zip_code': lot_features.get('zip_code', '27410'),
-                'latitude': lot_features.get('latitude', 36.089),
-                'longitude': lot_features.get('longitude', -79.908),
-                'year_built': 2024,  # New construction
-                'age': 0,
-                'subdivision': lot_features.get('subdivision', ''),
-                'proptype': lot_features.get('property_type', config.get('property_type', 'SFR')),
+                'beds': beds,
+                'baths': baths,
+                'sqft': sqft,
+                'lot_size_acres': lot_size_acres,
+                'lot_size_sqft': lot_size_sqft,
+                'year_built': year_built,
+                'stories': stories,
+                'latitude': latitude,
+                'longitude': longitude,
+                'price_per_sqft': price_per_sqft,
+                'price_per_bedroom': price_per_bedroom,
+                'price_per_bathroom': price_per_bathroom,
+                'lot_coverage_ratio': lot_coverage_ratio,
+                'beds_per_1000sqft': beds_per_1000sqft,
+                'bath_bed_ratio': bath_bed_ratio,
+                'age_years': age_years,
+                'sale_year': sale_year,
+                'sale_month': sale_month,
+                'sale_quarter': sale_quarter,
+                'is_spring_summer': is_spring_summer,
+                'days_since_sale': days_since_sale,
+                'is_sfr': is_sfr,
+                'is_townhome': is_townhome,
+                'is_condo': is_condo,
+                'subdivision_size': subdivision_size,
+                'quality_score': quality_score,
+                'condition_score': condition_score,
+                'overall_quality': overall_quality,
             }
-            
-            # Add finish level as numeric score
-            finish_scores = {'starter': 5, 'standard': 6, 'premium': 7, 'luxury': 9}
-            features['quality_score'] = finish_scores.get(config.get('finish_level', 'standard'), 6)
-            
-            # Add competitive context if available
-            if current_listings_context:
-                features.update({
-                    'num_similar_active_listings': current_listings_context.get('num_similar_active_listings', 0),
-                    'total_active_listings': current_listings_context.get('total_active_listings', 0),
-                    'inventory_level': current_listings_context.get('inventory_level', 'medium'),
-                    'proposed_price_percentile': current_listings_context.get('proposed_price_percentile', 0.5),
-                    'avg_dom_active': current_listings_context.get('avg_dom_active', 0),
-                })
             
             # Convert to DataFrame (single row)
             df = pd.DataFrame([features])
             
-            # Add derived features
-            df['price_per_sqft'] = df['sqft'] / df['sqft']  # Placeholder - would use market data
-            df['lot_to_house_ratio'] = (df['lot_size_acres'] * 43560) / df['sqft']
-            df['beds_baths_ratio'] = df['beds'] / df['baths']
+            # Ensure all numeric columns are numeric
+            numeric_cols = [col for col in df.columns if col not in ['subdivision', 'proptype']]
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # Ensure all required features are present (add defaults for missing ones)
-            # This is simplified - production would use full feature engineering
+            # Fill any NaN values with defaults
+            df = df.fillna(0)
             
             return df
             
         except Exception as e:
             logger.error(f"Error creating feature vector: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
+    
+    def _safe_get(self, obj: Any, keys: List[str]) -> Any:
+        """Safely get nested dictionary value."""
+        for key in keys:
+            if isinstance(obj, dict):
+                obj = obj.get(key, None)
+            else:
+                return None
+            if obj is None:
+                return None
+        return obj
     
     def _calculate_risk_score(
         self,

@@ -39,7 +39,39 @@ class FeatureEngineer:
         if not properties:
             return pd.DataFrame()
         
-        df = pd.DataFrame(properties)
+        # Extract sale_price and other nested fields before DataFrame creation
+        # This is needed because pandas doesn't handle deeply nested dicts well
+        extracted_data = []
+        for prop in properties:
+            row = {}
+            # Extract sale_price from nested structure
+            sale_price = self._safe_get(prop, ['sale', 'amount', 'saleamt'])
+            sale_date = self._safe_get(prop, ['sale', 'saleTransDate'])
+            
+            # Extract other nested fields
+            row['sale_price'] = sale_price
+            row['sale_date'] = sale_date
+            
+            # Flatten common fields
+            row['beds'] = self._safe_get(prop, ['building', 'rooms', 'beds']) or self._safe_get(prop, ['summary', 'beds'])
+            row['baths'] = self._safe_get(prop, ['building', 'rooms', 'bathstotal']) or self._safe_get(prop, ['summary', 'bathstotal'])
+            row['sqft'] = self._safe_get(prop, ['building', 'size', 'universalsize']) or self._safe_get(prop, ['summary', 'universalsize'])
+            row['lot_size_acres'] = self._safe_get(prop, ['lot', 'lotsize1'])
+            row['lot_size_sqft'] = self._safe_get(prop, ['lot', 'lotsize2'])
+            row['year_built'] = self._safe_get(prop, ['summary', 'yearbuilt'])
+            row['stories'] = self._safe_get(prop, ['building', 'summary', 'levels'])
+            row['zip_code'] = self._safe_get(prop, ['address', 'postal1'])
+            row['subdivision'] = self._safe_get(prop, ['area', 'subdname'])
+            row['latitude'] = self._safe_get(prop, ['location', 'latitude'])
+            row['longitude'] = self._safe_get(prop, ['location', 'longitude'])
+            row['property_type'] = self._safe_get(prop, ['summary', 'proptype'])
+            
+            # Store original property for any other extractions
+            row['_original_property'] = prop
+            
+            extracted_data.append(row)
+        
+        df = pd.DataFrame(extracted_data)
         
         logger.info(f"Engineering features for {len(df)} properties")
         
@@ -68,23 +100,43 @@ class FeatureEngineer:
     
     def _create_basic_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create basic features from raw property data."""
-        # Extract nested Attom fields
-        df['beds'] = df.apply(lambda x: self._safe_get(x, ['building', 'rooms', 'beds']), axis=1)
-        df['baths'] = df.apply(lambda x: self._safe_get(x, ['building', 'rooms', 'bathstotal']), axis=1)
-        df['sqft'] = df.apply(lambda x: self._safe_get(x, ['building', 'size', 'universalsize']), axis=1)
-        df['lot_size_acres'] = df.apply(lambda x: self._safe_get(x, ['lot', 'lotsize1']), axis=1)
-        df['lot_size_sqft'] = df.apply(lambda x: self._safe_get(x, ['lot', 'lotsize2']), axis=1)
-        df['year_built'] = df.apply(lambda x: self._safe_get(x, ['summary', 'yearbuilt']), axis=1)
-        df['stories'] = df.apply(lambda x: self._safe_get(x, ['building', 'summary', 'levels']), axis=1)
-        df['property_type'] = df.apply(lambda x: self._safe_get(x, ['summary', 'proptype']), axis=1)
-        df['subdivision'] = df.apply(lambda x: self._safe_get(x, ['area', 'subdname']), axis=1)
-        df['zip_code'] = df.apply(lambda x: self._safe_get(x, ['address', 'postal1']), axis=1)
-        df['latitude'] = df.apply(lambda x: self._safe_get(x, ['location', 'latitude']), axis=1)
-        df['longitude'] = df.apply(lambda x: self._safe_get(x, ['location', 'longitude']), axis=1)
+        # Fields are already extracted before DataFrame creation, so just ensure they're numeric
+        # Only extract from original property if field is missing
+        basic_fields = {
+            'beds': ['building', 'rooms', 'beds'],
+            'baths': ['building', 'rooms', 'bathstotal'],
+            'sqft': ['building', 'size', 'universalsize'],
+            'lot_size_acres': ['lot', 'lotsize1'],
+            'lot_size_sqft': ['lot', 'lotsize2'],
+            'year_built': ['summary', 'yearbuilt'],
+            'stories': ['building', 'summary', 'levels'],
+            'property_type': ['summary', 'proptype'],
+            'subdivision': ['area', 'subdname'],
+            'zip_code': ['address', 'postal1'],
+            'latitude': ['location', 'latitude'],
+            'longitude': ['location', 'longitude'],
+        }
         
-        # Sale price (target variable)
-        df['sale_price'] = df.apply(lambda x: self._safe_get(x, ['sale', 'amount', 'saleamt']), axis=1)
-        df['sale_date'] = df.apply(lambda x: self._safe_get(x, ['sale', 'saleTransDate']), axis=1)
+        # Fill in any missing fields from original property
+        for field, path in basic_fields.items():
+            if field not in df.columns or df[field].isna().all():
+                df[field] = df.apply(
+                    lambda x: self._safe_get(x.get('_original_property', {}), path) if pd.isna(x.get(field)) else x.get(field),
+                    axis=1
+                )
+        
+        # Sale price and date (already extracted, but ensure they're there)
+        if 'sale_price' not in df.columns or df['sale_price'].isna().all():
+            df['sale_price'] = df.apply(
+                lambda x: self._safe_get(x.get('_original_property', {}), ['sale', 'amount', 'saleamt']),
+                axis=1
+            )
+        
+        if 'sale_date' not in df.columns or df['sale_date'].isna().all():
+            df['sale_date'] = df.apply(
+                lambda x: self._safe_get(x.get('_original_property', {}), ['sale', 'saleTransDate']),
+                axis=1
+            )
         
         # Convert to numeric where appropriate
         numeric_cols = ['beds', 'baths', 'sqft', 'lot_size_acres', 'lot_size_sqft', 'year_built', 'stories', 'sale_price']
@@ -157,9 +209,9 @@ class FeatureEngineer:
     
     def _create_quality_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create quality/condition indicator features."""
-        # Extract quality and condition from nested data
-        df['quality'] = df.apply(lambda x: self._safe_get(x, ['building', 'summary', 'quality']), axis=1)
-        df['condition'] = df.apply(lambda x: self._safe_get(x, ['building', 'construction', 'condition']), axis=1)
+        # Extract quality and condition from nested data (using original property)
+        df['quality'] = df.apply(lambda x: self._safe_get(x.get('_original_property', {}), ['building', 'summary', 'quality']), axis=1)
+        df['condition'] = df.apply(lambda x: self._safe_get(x.get('_original_property', {}), ['building', 'construction', 'condition']), axis=1)
         
         # Convert quality to numeric score
         quality_map = {
