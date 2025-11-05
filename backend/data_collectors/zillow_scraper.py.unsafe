@@ -1,0 +1,492 @@
+"""
+Zillow Listings Scraper
+Scrapes Zillow for active listings with popularity metrics and analyzes what makes listings popular.
+"""
+
+import requests
+from bs4 import BeautifulSoup
+import logging
+import time
+import re
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
+from urllib.parse import urlencode, quote_plus
+import json
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class ZillowScraper:
+    """
+    Scrapes Zillow listings with popularity metrics.
+    Extracts views, saves, DOM, and features to analyze what makes listings popular.
+    """
+    
+    def __init__(self):
+        """Initialize Zillow scraper with proper headers."""
+        self.base_url = "https://www.zillow.com"
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.delay_between_requests = 2  # Be respectful with rate limiting
+        
+    def search_listings(
+        self,
+        zip_code: str,
+        status: str = 'active',  # 'active', 'pending', 'sold'
+        max_results: int = 100,
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+        property_type: str = 'houses'  # 'houses', 'townhomes', 'condos', 'apartments'
+    ) -> List[Dict[str, Any]]:
+        """
+        Search Zillow for listings in a ZIP code.
+        
+        Args:
+            zip_code: ZIP code to search
+            status: Listing status ('active', 'pending', 'sold')
+            max_results: Maximum number of results to return
+            price_min: Minimum price filter (optional)
+            price_max: Maximum price filter (optional)
+            property_type: Type of property to search for
+            
+        Returns:
+            List of listing dictionaries with details and popularity metrics
+        """
+        logger.info(f"Searching Zillow for {status} listings in ZIP {zip_code}")
+        
+        listings = []
+        page = 1
+        results_per_page = 40
+        
+        while len(listings) < max_results:
+            try:
+                # Build search URL
+                search_url = self._build_search_url(
+                    zip_code=zip_code,
+                    status=status,
+                    page=page,
+                    price_min=price_min,
+                    price_max=price_max,
+                    property_type=property_type
+                )
+                
+                logger.info(f"Fetching page {page}: {search_url}")
+                
+                response = self.session.get(search_url, timeout=15)
+                response.raise_for_status()
+                
+                # Parse listings from response
+                page_listings = self._parse_listings_page(response.text, zip_code)
+                
+                if not page_listings:
+                    logger.info(f"No more listings found on page {page}")
+                    break
+                
+                listings.extend(page_listings)
+                logger.info(f"Found {len(page_listings)} listings on page {page} ({len(listings)} total)")
+                
+                # Be respectful with rate limiting
+                time.sleep(self.delay_between_requests)
+                
+                page += 1
+                
+                # Break if we've reached max results or no more pages
+                if len(page_listings) < results_per_page:
+                    break
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching page {page}: {e}")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error on page {page}: {e}")
+                break
+        
+        logger.info(f"Total listings collected: {len(listings)}")
+        return listings[:max_results]
+    
+    def _build_search_url(
+        self,
+        zip_code: str,
+        status: str,
+        page: int = 1,
+        price_min: Optional[int] = None,
+        price_max: Optional[int] = None,
+        property_type: str = 'houses'
+    ) -> str:
+        """Build Zillow search URL with parameters."""
+        # Zillow URL structure
+        base_path = f"/homes/{zip_code}_rb/"
+        
+        # Status mapping
+        status_map = {
+            'active': '',
+            'pending': '/pending/',
+            'sold': '/sold/'
+        }
+        status_path = status_map.get(status, '')
+        
+        url = f"{self.base_url}{base_path}{status_path}"
+        
+        # Add query parameters
+        params = {}
+        if page > 1:
+            params['page'] = page
+        if price_min:
+            params['priced'] = price_min
+        if price_max:
+            params['priced'] = f"{price_min or 0}-{price_max}"
+        
+        if params:
+            url += "?" + urlencode(params)
+        
+        return url
+    
+    def _parse_listings_page(self, html: str, zip_code: str) -> List[Dict[str, Any]]:
+        """
+        Parse listings from Zillow search results page.
+        
+        Note: Zillow uses dynamic content loaded via JavaScript.
+        This is a simplified parser that works with static HTML.
+        For production, consider using Selenium or Zillow's API.
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        listings = []
+        
+        # Zillow structure (may need adjustment based on actual HTML structure)
+        # Look for listing cards in search results
+        listing_cards = soup.find_all('div', {'data-test': 'property-card'})
+        
+        if not listing_cards:
+            # Try alternative selectors
+            listing_cards = soup.find_all('article', class_=re.compile('list-card'))
+            if not listing_cards:
+                listing_cards = soup.find_all('li', {'data-test': re.compile('result')})
+        
+        logger.info(f"Found {len(listing_cards)} listing cards on page")
+        
+        for card in listing_cards:
+            try:
+                listing = self._extract_listing_from_card(card, zip_code)
+                if listing:
+                    listings.append(listing)
+            except Exception as e:
+                logger.warning(f"Error parsing listing card: {e}")
+                continue
+        
+        return listings
+    
+    def _extract_listing_from_card(self, card, zip_code: str) -> Optional[Dict[str, Any]]:
+        """Extract listing data from a single listing card."""
+        try:
+            # Extract price
+            price_elem = card.find('span', {'data-test': 'property-card-price'})
+            if not price_elem:
+                price_elem = card.find(class_=re.compile('list-card-price'))
+            
+            price_text = price_elem.get_text(strip=True) if price_elem else None
+            price = self._parse_price(price_text) if price_text else None
+            
+            # Extract address
+            address_elem = card.find('address', {'data-test': 'property-card-addr'})
+            if not address_elem:
+                address_elem = card.find(class_=re.compile('list-card-addr'))
+            
+            address = address_elem.get_text(strip=True) if address_elem else None
+            
+            # Extract link to listing detail page
+            link_elem = card.find('a', {'data-test': 'property-card-link'})
+            if not link_elem:
+                link_elem = card.find('a', href=re.compile('/homedetails/'))
+            
+            detail_url = None
+            zpid = None
+            if link_elem:
+                detail_url = link_elem.get('href', '')
+                if detail_url and not detail_url.startswith('http'):
+                    detail_url = self.base_url + detail_url
+                # Extract ZPID from URL
+                zpid_match = re.search(r'/(\d+)_zpid/', detail_url)
+                if zpid_match:
+                    zpid = zpid_match.group(1)
+            
+            # Extract beds/baths/sqft
+            details_elem = card.find('ul', {'data-test': 'property-card-details'})
+            if not details_elem:
+                details_elem = card.find(class_=re.compile('list-card-details'))
+            
+            beds, baths, sqft = None, None, None
+            if details_elem:
+                details_text = details_elem.get_text()
+                beds_match = re.search(r'(\d+)\s*bed', details_text, re.I)
+                baths_match = re.search(r'(\d+(?:\.\d+)?)\s*bath', details_text, re.I)
+                sqft_match = re.search(r'([\d,]+)\s*sqft', details_text, re.I)
+                
+                beds = int(beds_match.group(1)) if beds_match else None
+                baths = float(baths_match.group(1)) if baths_match else None
+                sqft_str = sqft_match.group(1).replace(',', '') if sqft_match else None
+                sqft = int(sqft_str) if sqft_str else None
+            
+            # Extract days on Zillow (DOM)
+            dom_elem = card.find(string=re.compile(r'\d+\s*day', re.I))
+            dom = None
+            if dom_elem:
+                dom_match = re.search(r'(\d+)', dom_elem)
+                dom = int(dom_match.group(1)) if dom_match else None
+            
+            # Extract views/saves (popularity metrics) - may require detail page
+            views = None
+            saves = None
+            
+            listing = {
+                'zpid': zpid,
+                'detail_url': detail_url,
+                'address': address,
+                'zip_code': zip_code,
+                'price': price,
+                'beds': beds,
+                'baths': baths,
+                'sqft': sqft,
+                'days_on_zillow': dom,
+                'views': views,  # Will be populated from detail page
+                'saves': saves,  # Will be populated from detail page
+                'scraped_at': datetime.now().isoformat(),
+            }
+            
+            # Fetch detail page for additional data (views, saves, features)
+            if detail_url:
+                try:
+                    detail_data = self._fetch_listing_details(detail_url, zpid)
+                    listing.update(detail_data)
+                except Exception as e:
+                    logger.warning(f"Could not fetch details for {detail_url}: {e}")
+            
+            return listing
+            
+        except Exception as e:
+            logger.warning(f"Error extracting listing: {e}")
+            return None
+    
+    def _parse_price(self, price_text: str) -> Optional[int]:
+        """Parse price from text like '$350,000' or '$1.2M'."""
+        if not price_text:
+            return None
+        
+        # Remove $ and whitespace
+        price_text = price_text.replace('$', '').replace(',', '').strip()
+        
+        # Handle 'M' for millions
+        if 'M' in price_text.upper():
+            price_text = price_text.upper().replace('M', '')
+            try:
+                return int(float(price_text) * 1000000)
+            except:
+                return None
+        
+        # Handle 'K' for thousands
+        if 'K' in price_text.upper():
+            price_text = price_text.upper().replace('K', '')
+            try:
+                return int(float(price_text) * 1000)
+            except:
+                return None
+        
+        try:
+            return int(price_text)
+        except:
+            return None
+    
+    def _fetch_listing_details(self, detail_url: str, zpid: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetch detailed listing information including popularity metrics.
+        
+        Args:
+            detail_url: URL to listing detail page
+            zpid: Zillow property ID (optional, can extract from URL)
+            
+        Returns:
+            Dictionary with detailed listing data
+        """
+        logger.debug(f"Fetching details for {detail_url}")
+        
+        try:
+            response = self.session.get(detail_url, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            details = {}
+            
+            # Try to extract views and saves from the page
+            # Zillow shows this as "X views" or "Saved by X users"
+            views_match = re.search(r'(\d+(?:,\d+)?)\s*view', response.text, re.I)
+            if views_match:
+                details['views'] = int(views_match.group(1).replace(',', ''))
+            
+            saves_match = re.search(r'saved\s+by\s+(\d+)', response.text, re.I)
+            if not saves_match:
+                saves_match = re.search(r'(\d+)\s+save', response.text, re.I)
+            if saves_match:
+                details['saves'] = int(saves_match.group(1))
+            
+            # Extract features from description/details
+            description_elem = soup.find('div', {'id': 'ds-container'})
+            if not description_elem:
+                description_elem = soup.find('div', class_=re.compile('description'))
+            
+            features = []
+            if description_elem:
+                description_text = description_elem.get_text().lower()
+                
+                # Common feature keywords
+                feature_keywords = [
+                    'granite', 'quartz', 'stainless steel', 'hardwood', 'carpet', 'tile',
+                    'fireplace', 'garage', 'fenced yard', 'deck', 'patio', 'pool',
+                    'updated kitchen', 'renovated', 'new roof', 'central air', 'heat pump',
+                    'walk-in closet', 'master suite', 'open floor plan', 'vaulted ceilings'
+                ]
+                
+                for keyword in feature_keywords:
+                    if keyword in description_text:
+                        features.append(keyword)
+            
+            details['features'] = features
+            
+            # Extract list date
+            list_date_match = re.search(r'listed\s+on\s+(\d{1,2}/\d{1,2}/\d{4})', response.text, re.I)
+            if list_date_match:
+                try:
+                    list_date = datetime.strptime(list_date_match.group(1), '%m/%d/%Y')
+                    details['list_date'] = list_date.strftime('%Y-%m-%d')
+                except:
+                    pass
+            
+            # Be respectful with rate limiting
+            time.sleep(self.delay_between_requests)
+            
+            return details
+            
+        except Exception as e:
+            logger.warning(f"Error fetching listing details: {e}")
+            return {}
+    
+    def analyze_pending_listings(
+        self,
+        active_listings: List[Dict[str, Any]],
+        pending_listings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Analyze listings that went from active to pending to understand what made them popular.
+        
+        Args:
+            active_listings: Previously active listings
+            pending_listings: Current pending listings
+            
+        Returns:
+            List of analysis results showing DOM to pending and what made them popular
+        """
+        logger.info(f"Analyzing {len(pending_listings)} pending listings")
+        
+        # Match active listings to pending by address or ZPID
+        pending_analyses = []
+        
+        for pending in pending_listings:
+            # Find matching active listing
+            active_match = None
+            for active in active_listings:
+                if (pending.get('zpid') and active.get('zpid') and 
+                    pending['zpid'] == active['zpid']):
+                    active_match = active
+                    break
+                elif (pending.get('address') and active.get('address') and
+                      self._addresses_match(pending['address'], active['address'])):
+                    active_match = active
+                    break
+            
+            if active_match:
+                # Calculate DOM to pending
+                list_date = active_match.get('list_date') or active_match.get('scraped_at')
+                pending_date = pending.get('list_date') or pending.get('scraped_at')
+                
+                dom_to_pending = None
+                if list_date and pending_date:
+                    try:
+                        if isinstance(list_date, str):
+                            list_dt = datetime.fromisoformat(list_date.replace('Z', '+00:00'))
+                        else:
+                            list_dt = list_date
+                        
+                        if isinstance(pending_date, str):
+                            pending_dt = datetime.fromisoformat(pending_date.replace('Z', '+00:00'))
+                        else:
+                            pending_dt = pending_date
+                        
+                        dom_to_pending = (pending_dt - list_dt).days
+                    except Exception as e:
+                        logger.warning(f"Error calculating DOM: {e}")
+                
+                analysis = {
+                    'zpid': pending.get('zpid'),
+                    'address': pending.get('address'),
+                    'price': pending.get('price'),
+                    'beds': pending.get('beds'),
+                    'baths': pending.get('baths'),
+                    'sqft': pending.get('sqft'),
+                    'dom_to_pending': dom_to_pending,
+                    'views': pending.get('views') or active_match.get('views'),
+                    'saves': pending.get('saves') or active_match.get('saves'),
+                    'features': pending.get('features', []) or active_match.get('features', []),
+                    'popularity_score': self._calculate_popularity_score(pending, active_match),
+                }
+                
+                pending_analyses.append(analysis)
+        
+        # Sort by DOM to pending (fastest to pending first)
+        pending_analyses.sort(key=lambda x: x['dom_to_pending'] or 999)
+        
+        logger.info(f"Analyzed {len(pending_analyses)} listings that went to pending")
+        return pending_analyses
+    
+    def _addresses_match(self, addr1: str, addr2: str) -> bool:
+        """Check if two addresses match (normalized comparison)."""
+        # Normalize addresses for comparison
+        def normalize(addr):
+            return re.sub(r'[^\w\s]', '', addr.lower()).strip()
+        
+        return normalize(addr1) == normalize(addr2)
+    
+    def _calculate_popularity_score(
+        self,
+        listing: Dict[str, Any],
+        previous_listing: Optional[Dict[str, Any]] = None
+    ) -> float:
+        """
+        Calculate a popularity score based on views, saves, and DOM.
+        Lower DOM + higher views/saves = higher popularity.
+        """
+        views = listing.get('views', 0) or 0
+        saves = listing.get('saves', 0) or 0
+        dom = listing.get('days_on_zillow') or listing.get('dom_to_pending') or 999
+        
+        # Normalize scores (views are typically much higher than saves)
+        views_score = min(views / 100.0, 10.0)  # Cap at 10 points
+        saves_score = min(saves * 2.0, 10.0)  # Saves are worth more
+        
+        # Lower DOM = higher score (inverse relationship)
+        dom_score = max(0, 10.0 - (dom / 10.0))  # 0 days = 10 points, 100 days = 0 points
+        
+        popularity_score = (views_score * 0.3) + (saves_score * 0.4) + (dom_score * 0.3)
+        
+        return round(popularity_score, 2)
+
+
+# Singleton instance
+zillow_scraper = ZillowScraper()
+

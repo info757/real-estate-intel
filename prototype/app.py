@@ -1182,7 +1182,8 @@ def show_ml_recommendations():
                 results = recommendation_engine.generate_recommendations(
                     lot_features=lot_features,
                     property_type=property_type,
-                    top_n=5
+                    top_n=5,
+                    use_market_insights=True  # Enable fast-seller model predictions
                 )
                 
                 if 'error' in results:
@@ -1258,6 +1259,17 @@ def show_ml_recommendations():
                                 st.metric("Sell Probability", f"{demand_sell_probability*100:.0f}%")
                                 st.metric("Expected DOM", f"{demand_expected_dom:.0f} days")
                                 
+                                # Fast-seller predictions if available
+                                fast_seller_prob = rec_demand.get('fast_seller_probability')
+                                fast_seller_dom = rec_demand.get('fast_seller_dom')
+                                if fast_seller_prob is not None:
+                                    st.markdown("**Fast-Seller Prediction:**")
+                                    st.metric("Fast-Seller Probability", f"{fast_seller_prob*100:.0f}%", 
+                                             help="Probability of selling within 14 days")
+                                    if fast_seller_dom is not None:
+                                        st.metric("Predicted DOM to Pending", f"{fast_seller_dom:.0f} days",
+                                                 help="Expected days on market before pending")
+                                
                                 if demand_meets_threshold:
                                     st.success("✅ Meets demand threshold")
                                 else:
@@ -1293,6 +1305,51 @@ def show_ml_recommendations():
                             st.markdown("---")
                             st.markdown("**Explanation:**")
                             st.info(rec.get('explanation', 'No explanation available'))
+                            
+                            # Fast-seller insights if available
+                            insights = rec_copy.get('insights')
+                            if insights:
+                                st.markdown("---")
+                                st.markdown("**📈 Market Insights:**")
+                                
+                                # Summary
+                                if insights.get('summary'):
+                                    st.success(f"**Summary:** {insights['summary']}")
+                                
+                                # Market alignment
+                                market_alignment = insights.get('market_alignment', {})
+                                if market_alignment:
+                                    alignment_level = market_alignment.get('level', 'Unknown')
+                                    alignment_desc = market_alignment.get('description', '')
+                                    if alignment_level == 'Excellent':
+                                        st.success(f"✅ **Market Alignment: {alignment_level}** - {alignment_desc}")
+                                    elif alignment_level == 'Good':
+                                        st.info(f"📊 **Market Alignment: {alignment_level}** - {alignment_desc}")
+                                    else:
+                                        st.warning(f"⚠️ **Market Alignment: {alignment_level}** - {alignment_desc}")
+                                
+                                # Key drivers
+                                key_drivers = insights.get('key_drivers', [])
+                                if key_drivers:
+                                    with st.expander("🔑 Key Drivers (Top Features)"):
+                                        for driver in key_drivers[:5]:
+                                            st.write(f"**{driver.get('readable_name', driver.get('feature', 'Unknown'))}**")
+                                            st.progress(driver.get('importance', 0))
+                                            st.caption(driver.get('impact', ''))
+                                
+                                # Pattern insights
+                                pattern_insights = insights.get('pattern_insights', [])
+                                if pattern_insights:
+                                    with st.expander("🎯 Pattern Insights"):
+                                        for insight in pattern_insights:
+                                            st.info(insight)
+                                
+                                # Recommendations
+                                recommendations = insights.get('recommendations', [])
+                                if recommendations:
+                                    with st.expander("💡 Actionable Recommendations"):
+                                        for rec in recommendations:
+                                            st.write(f"• {rec}")
                     
                     # Summary statistics
                     st.markdown("---")

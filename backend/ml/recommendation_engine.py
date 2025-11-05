@@ -68,7 +68,8 @@ class RecommendationEngine:
         candidate_configs: Optional[List[Dict[str, Any]]] = None,
         historical_data: Optional[List[Dict[str, Any]]] = None,
         current_listings_context: Optional[Dict[str, Any]] = None,
-        top_n: int = 5
+        top_n: int = 5,
+        use_market_insights: bool = True
     ) -> Dict[str, Any]:
         """
         Generate optimal build recommendations for a specific lot.
@@ -172,6 +173,18 @@ class RecommendationEngine:
                         'recommendations': [],
                         'total_evaluated': 0
                     }
+            
+            # Load fast-seller model if using market insights
+            if use_market_insights and FAST_SELLER_AVAILABLE:
+                try:
+                    print("[DEBUG] Loading fast-seller model...")
+                    fast_seller_model.load()
+                    logger.info("Fast-seller model loaded successfully")
+                    print("[DEBUG] Fast-seller model loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Fast-seller model not available: {e}. Continuing without market insights.")
+                    print(f"[DEBUG] Warning: Fast-seller model not available: {e}")
+                    use_market_insights = False
         except Exception as e:
             error_msg = f"Error loading models: {e}"
             logger.error(error_msg)
@@ -223,7 +236,8 @@ class RecommendationEngine:
                     lot_features=lot_features,
                     property_type=property_type,
                     historical_data=historical_data,
-                    current_listings_context=current_listings_context
+                    current_listings_context=current_listings_context,
+                    use_market_insights=use_market_insights
                 )
                 
                 if evaluation:
@@ -257,8 +271,18 @@ class RecommendationEngine:
         # Filter by constraints
         filtered_results = self._apply_constraints(results)
         
-        # Sort by margin (descending)
-        filtered_results.sort(key=lambda x: x['margin']['gross_margin'], reverse=True)
+        # Sort by combined score (margin + fast-seller probability if available)
+        def get_combined_score(rec):
+            margin_score = rec['margin']['gross_margin']
+            # Add fast-seller boost if available (0-30% of margin)
+            if 'fast_seller_probability' in rec.get('demand', {}):
+                fast_prob = rec['demand']['fast_seller_probability']
+                # Boost margin by up to 30% based on fast-seller probability
+                fast_boost = margin_score * 0.3 * fast_prob
+                return margin_score + fast_boost
+            return margin_score
+        
+        filtered_results.sort(key=get_combined_score, reverse=True)
         
         # Get top N
         top_recommendations = filtered_results[:top_n]
@@ -270,9 +294,32 @@ class RecommendationEngine:
                 config = rec.get('configuration', {})
                 logger.info(f"  {i}. {config.get('beds', '?')}BR/{config.get('baths', '?')}BA, {config.get('sqft', '?')} sqft - Price: ${rec.get('predicted_price', 0):,.0f}, Margin: {rec.get('margin', {}).get('gross_margin_pct', 0):.1f}%")
         
-        # Generate explanations for top recommendations
+        # Generate explanations and insights for top recommendations
         for rec in top_recommendations:
             rec['explanation'] = self._generate_explanation(rec, filtered_results)
+            # Add fast-seller insights if available
+            if use_market_insights and FAST_SELLER_AVAILABLE:
+                try:
+                    fast_prob = rec.get('demand', {}).get('fast_seller_probability', 0)
+                    fast_dom = rec.get('demand', {}).get('fast_seller_dom', 0)
+                    margin_pct = rec.get('margin', {}).get('gross_margin_pct', 0)
+                    
+                    # Get feature importance if available
+                    feature_importance = None
+                    if fast_seller_model.fast_seller_classifier is not None:
+                        feature_importance = fast_seller_model.get_feature_importance('classifier')
+                    
+                    # Generate insights
+                    if insights_generator:
+                        rec['insights'] = insights_generator.generate_recommendation_insights(
+                            configuration=rec['configuration'],
+                            fast_seller_prob=fast_prob,
+                            predicted_dom=fast_dom,
+                            margin_pct=margin_pct,
+                            feature_importance=feature_importance
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to generate insights: {e}")
         
         return {
             'recommendations': top_recommendations,
@@ -365,7 +412,8 @@ class RecommendationEngine:
         lot_features: Dict[str, Any],
         property_type: str,
         historical_data: Optional[List[Dict[str, Any]]] = None,
-        current_listings_context: Optional[Dict[str, Any]] = None
+        current_listings_context: Optional[Dict[str, Any]] = None,
+        use_market_insights: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluate a single configuration.
@@ -415,6 +463,18 @@ class RecommendationEngine:
             sell_probability = demand_pred['sell_probability'][0]
             expected_dom = demand_pred['expected_dom'][0]
             
+            # 3b. Fast-seller model predictions (if using market insights)
+            fast_seller_prob = sell_probability  # Default to demand model
+            fast_seller_dom = expected_dom  # Default to demand model
+            if use_market_insights and FAST_SELLER_AVAILABLE:
+                try:
+                    if fast_seller_model.fast_seller_classifier is not None:
+                        fast_seller_prob = fast_seller_model.predict_fast_seller_probability(feature_vector)[0]
+                        fast_seller_dom = fast_seller_model.predict_dom(feature_vector)[0]
+                        logger.debug(f"Fast-seller prob: {fast_seller_prob:.3f}, DOM: {fast_seller_dom:.1f}")
+                except Exception as e:
+                    logger.warning(f"Fast-seller prediction failed: {e}")
+            
             # 4. Estimate cost
             cost_breakdown = cost_estimator.estimate_cost_for_config(
                 config=config,
@@ -428,10 +488,12 @@ class RecommendationEngine:
                 sga_allocation=self.sga_allocation
             )
             
-            # 6. Calculate risk score (lower is better)
+            # 6. Calculate risk score (lower is better) - use fast-seller if available
+            effective_sell_prob = fast_seller_prob if (use_market_insights and FAST_SELLER_AVAILABLE) else sell_probability
+            effective_dom = fast_seller_dom if (use_market_insights and FAST_SELLER_AVAILABLE) else expected_dom
             risk_score = self._calculate_risk_score(
-                sell_probability=sell_probability,
-                expected_dom=expected_dom,
+                sell_probability=effective_sell_prob,
+                expected_dom=effective_dom,
                 margin_pct=margin['gross_margin_pct']
             )
             
@@ -443,6 +505,8 @@ class RecommendationEngine:
                 'demand': {
                     'sell_probability': float(sell_probability),
                     'expected_dom': float(expected_dom),
+                    'fast_seller_probability': float(fast_seller_prob),
+                    'fast_seller_dom': float(fast_seller_dom),
                     'meets_demand_threshold': sell_probability >= self.min_sell_probability
                 },
                 'cost': {
