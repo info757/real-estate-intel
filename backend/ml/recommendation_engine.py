@@ -13,6 +13,13 @@ from backend.ml.pricing_model import pricing_model
 from backend.ml.demand_model import demand_model
 from backend.ml.cost_estimator import cost_estimator, CostBreakdown
 from backend.ml.feature_engineering import feature_engineer
+try:
+    from backend.ml.fast_seller_model import fast_seller_model
+    from backend.ml.insights_generator import insights_generator
+    FAST_SELLER_AVAILABLE = True
+except ImportError:
+    FAST_SELLER_AVAILABLE = False
+    logger.warning("Fast-seller model modules not available")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

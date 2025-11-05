@@ -270,7 +270,164 @@ class FeatureEngineer:
             else:
                 return None
         return obj
+    def _create_market_context_features(
+        self,
+        df: pd.DataFrame,
+        market_context: Optional[Dict[str, Any]] = None
+    ) -> pd.DataFrame:
+        """Add market context features for fast-seller prediction."""
+        # Active inventory count (default to 0 if not available)
+        df['active_inventory_count'] = market_context.get('active_inventory_count', 0) if market_context else 0
+        
+        # Median DOM in ZIP code
+        df['median_dom_in_zip'] = market_context.get('median_dom_in_zip', 30) if market_context else 30
+        
+        # Price trend (1 = increasing, 0 = stable, -1 = decreasing)
+        price_trend = market_context.get('price_trend_last_90_days', 0) if market_context else 0
+        df['price_trend_last_90_days'] = price_trend
+        
+        # Subdivision sales velocity (days between sales in subdivision)
+        df['subdivision_sales_velocity'] = market_context.get('subdivision_sales_velocity', 60) if market_context else 60
+        
+        return df
     
+    def _create_pricing_strategy_features(
+        self,
+        df: pd.DataFrame,
+        market_context: Optional[Dict[str, Any]] = None
+    ) -> pd.DataFrame:
+        """Add pricing strategy features."""
+        # Price vs neighborhood median (as percentage)
+        if 'sale_price' in df.columns and market_context:
+            neighborhood_median = market_context.get('neighborhood_median_price', df['sale_price'].median())
+            df['price_vs_neighborhood_median'] = (
+                (df['sale_price'] - neighborhood_median) / neighborhood_median * 100
+            ).fillna(0)
+        else:
+            df['price_vs_neighborhood_median'] = 0
+        
+        # Price ending pattern (last 3 digits)
+        if 'sale_price' in df.columns:
+            df['price_ending_pattern'] = (df['sale_price'] % 1000).fillna(0)
+        else:
+            df['price_ending_pattern'] = 0
+        
+        # Price per sqft vs market
+        if 'price_per_sqft' in df.columns and market_context:
+            market_price_per_sqft = market_context.get('market_price_per_sqft', df['price_per_sqft'].median())
+            df['price_per_sqft_vs_market'] = (
+                (df['price_per_sqft'] - market_price_per_sqft) / market_price_per_sqft * 100
+            ).fillna(0)
+        else:
+            df['price_per_sqft_vs_market'] = 0
+        
+        return df
+    
+    def _create_timing_features(
+        self,
+        df: pd.DataFrame,
+        date_column: str = 'sale_date'
+    ) -> pd.DataFrame:
+        """Add timing features (list day of week, month, season)."""
+        if date_column not in df.columns:
+            # Use current date as fallback
+            df['list_day_of_week'] = datetime.now().weekday()
+            df['list_month'] = datetime.now().month
+            df['season'] = ((datetime.now().month - 1) // 3) + 1
+            df['days_since_last_sale_in_subdivision'] = 0
+            return df
+        
+        # Convert to datetime if string
+        if df[date_column].dtype == 'object':
+            df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
+        
+        # Day of week (0 = Monday, 6 = Sunday)
+        df['list_day_of_week'] = df[date_column].dt.dayofweek.fillna(0)
+        
+        # Month (1-12)
+        df['list_month'] = df[date_column].dt.month.fillna(1)
+        
+        # Season (1=Winter, 2=Spring, 3=Summer, 4=Fall)
+        df['season'] = ((df[date_column].dt.month - 1) // 3 + 1).fillna(1)
+        
+        # Days since last sale in subdivision (simplified - would need grouping)
+        df['days_since_last_sale_in_subdivision'] = 0  # Placeholder - would need subdivision grouping
+        
+        return df
+    
+    def _create_llm_extracted_features(
+        self,
+        df: pd.DataFrame,
+        extracted_features_list: Optional[List[Dict[str, Any]]] = None
+    ) -> pd.DataFrame:
+        """Add LLM-extracted features as binary flags."""
+        if not extracted_features_list:
+            return df
+        
+        # Get all unique features across all listings
+        all_features = set()
+        for features_dict in extracted_features_list:
+            if isinstance(features_dict, dict):
+                all_features.update(features_dict.get('interior', []))
+                all_features.update(features_dict.get('exterior', []))
+                all_features.update(features_dict.get('upgrades', []))
+        
+        # Create binary feature columns for each feature
+        for feature in all_features:
+            # Clean feature name for column name
+            col_name = f"has_{feature.lower().replace(' ', '_').replace('-', '_')[:30]}"
+            
+            # Check if feature is present in each listing
+            has_feature = []
+            for features_dict in extracted_features_list:
+                if isinstance(features_dict, dict):
+                    feature_present = (
+                        feature in features_dict.get('interior', []) or
+                        feature in features_dict.get('exterior', []) or
+                        feature in features_dict.get('upgrades', [])
+                    )
+                    has_feature.append(1 if feature_present else 0)
+                else:
+                    has_feature.append(0)
+            
+            # Add column if we have data
+            if len(has_feature) == len(df):
+                df[col_name] = has_feature
+            else:
+                # Pad with zeros if length mismatch
+                df[col_name] = 0
+        
+        return df
+    
+    def engineer_features_for_fast_seller(
+        self,
+        listings: List[Dict[str, Any]],
+        market_context: Optional[Dict[str, Any]] = None,
+        extracted_features_list: Optional[List[Dict[str, Any]]] = None
+    ) -> pd.DataFrame:
+        """
+        Engineer features specifically for fast-seller prediction model.
+        
+        Args:
+            listings: List of listing dictionaries
+            market_context: Market context data (inventory, DOM, trends)
+            extracted_features_list: LLM-extracted features for each listing
+            
+        Returns:
+            DataFrame with fast-seller model features
+        """
+        # Start with basic feature engineering
+        df = self.engineer_features(listings, competitive_context=market_context)
+        
+        # Add fast-seller specific features
+        df = self._create_market_context_features(df, market_context)
+        df = self._create_pricing_strategy_features(df, market_context)
+        df = self._create_timing_features(df, date_column='list_date')
+        df = self._create_llm_extracted_features(df, extracted_features_list)
+        
+        return df
+
+
     def get_feature_names(self) -> List[str]:
         """
         Get list of feature names that will be created.
