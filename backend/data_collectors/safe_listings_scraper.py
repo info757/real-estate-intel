@@ -246,8 +246,95 @@ class SafeListingsScraper:
         
         logger.info(f"Fetched {len(listings)} listings from Zillow API (via RapidAPI)")
         return listings[:max_results]
-        return listings
+    def fetch_sold_with_details(
+        self,
+        zip_code: str,
+        days_back: int = 180,
+        max_results: int = 100,
+        fetch_details: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Fetch recently sold listings with full detail pages."""
+        if not self.rapidapi_key:
+            raise ValueError("RapidAPI key not available")
+        
+        logger.info(f"Fetching sold listings for ZIP {zip_code}...")
+        sold_listings = self._fetch_zillow_rapidapi(
+            zip_code=zip_code, status='sold', max_results=max_results
+        )
+        
+        if not fetch_details:
+            return sold_listings
+        
+        logger.info(f"Fetching detail pages for {len(sold_listings)} listings...")
+        detailed_listings = []
+        
+        for i, listing in enumerate(sold_listings):
+            zpid = listing.get('zpid')
+            detail_url = listing.get('detail_url')
+            
+            if not zpid and not detail_url:
+                continue
+            
+            try:
+                detail_data = self._fetch_listing_detail(zpid=zpid, detail_url=detail_url)
+                if detail_data:
+                    detailed_listings.append({**listing, **detail_data})
+                else:
+                    detailed_listings.append(listing)
+                time.sleep(1)
+            except Exception as e:
+                logger.warning(f"Error fetching detail: {e}")
+                detailed_listings.append(listing)
+        
+        return detailed_listings
     
+    def _fetch_listing_detail(
+        self,
+        zpid: Optional[str] = None,
+        detail_url: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch detailed information for a single listing."""
+        if not self.rapidapi_key:
+            return None
+        
+        if zpid:
+            url = "https://zillow-com1.p.rapidapi.com/property"
+            params = {'zpid': zpid}
+        elif detail_url:
+            import re
+            zpid_match = re.search(r'/(\d+)_zpid', detail_url)
+            if zpid_match:
+                url = "https://zillow-com1.p.rapidapi.com/property"
+                params = {'zpid': zpid_match.group(1)}
+            else:
+                url = "https://zillow-com1.p.rapidapi.com/propertyByUrl"
+                params = {'property_url': detail_url}
+        else:
+            return None
+        
+        headers = {
+            'X-RapidAPI-Key': self.rapidapi_key,
+            'X-RapidAPI-Host': 'zillow-com1.p.rapidapi.com'
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            return {
+                'description': data.get('description', ''),
+                'datePosted': data.get('datePosted'),
+                'dateSold': data.get('dateSold'),
+                'priceHistory': data.get('priceHistory', []),
+                'yearBuilt': data.get('yearBuilt'),
+                'lotSize': data.get('lotSize'),
+            }
+        except Exception as e:
+            logger.warning(f"Error fetching detail: {e}")
+            return None
+    
+
     def _fetch_from_attom(
         self,
         zip_code: str,
