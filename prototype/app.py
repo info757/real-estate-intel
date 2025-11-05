@@ -25,6 +25,8 @@ from backend.ai_engine.rag_system import QdrantRAGSystem
 from backend.analyzers.feature_analyzer import feature_analyzer
 from backend.analyzers.demand_predictor import demand_predictor
 from backend.ml.recommendation_engine import recommendation_engine
+from backend.data_collectors.safe_listings_scraper import safe_listings_scraper
+from backend.analyzers.popularity_analyzer import popularity_analyzer
 from backend.ml.guardrails import guardrails
 from backend.ml.backtesting import backtester
 from config.settings import settings
@@ -110,7 +112,7 @@ def main():
             "Navigation",
             ["🏠 Dashboard", "📊 Market Analysis", "🎯 Micro-Market Analysis",
              "🏞️ Land Opportunities", "🏗️ Product Intelligence", 
-             "💰 Financial Modeling", "🧠 ML Recommendations", "🤖 AI Assistant"]
+             "💰 Financial Modeling", "🧠 ML Recommendations", "🔥 Listing Popularity", "🤖 AI Assistant"]
         )
         
         st.markdown("---")
@@ -140,6 +142,8 @@ def main():
         show_financial_modeling()
     elif page == "🧠 ML Recommendations":
         show_ml_recommendations()
+    elif page == "🔥 Listing Popularity":
+        show_listing_popularity()
     elif page == "🤖 AI Assistant":
         show_ai_assistant()
 
@@ -1316,6 +1320,234 @@ def show_ml_recommendations():
                 st.info("💡 **Tips:**\n- Make sure models are trained: `python backend/ml/train_models.py`\n- Verify lot information is correct\n- Try adjusting the constraints")
 
 
+def show_listing_popularity():
+    """Show listing popularity analysis page."""
+    st.header("🔥 Listing Popularity Analysis")
+    
+    st.markdown("""
+    **Analyze active listings from Zillow to identify what makes properties popular:**
+    - Which listings get the most attention (views, saves)
+    - What features drive popularity
+    - DOM to pending analysis (fast-selling properties)
+    - Competitive insights for your builds
+    """)
+    
+    st.markdown("---")
+    
+    # Input section
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        zip_code = st.text_input("ZIP Code", value="27410", key="listing_zip")
+    
+    with col2:
+        status = st.selectbox(
+            "Listing Status",
+            ["active", "pending", "sold"],
+            index=0,
+            key="listing_status"
+        )
+    
+    with col3:
+        max_results = st.number_input(
+            "Max Results",
+            min_value=10,
+            max_value=200,
+            value=50,
+            step=10,
+            key="listing_max_results"
+        )
+    
+    # Source selection
+    source = st.radio(
+        "Data Source",
+        ["auto", "rapidapi_zillow", "attom"],
+        index=0,
+        help="Auto tries RapidAPI first, falls back to Attom if needed",
+        horizontal=True
+    )
+    
+    st.markdown("---")
+    
+    # Fetch button
+    if st.button("🚀 Fetch & Analyze Listings", type="primary", key="fetch_listings"):
+        with st.spinner(f"Fetching {status} listings from ZIP {zip_code}..."):
+            try:
+                # Fetch listings
+                listings = safe_listings_scraper.fetch_listings(
+                    zip_code=zip_code,
+                    status=status,
+                    max_results=max_results,
+                    source=source
+                )
+                
+                if not listings:
+                    st.error("❌ No listings found. Please check:")
+                    st.info("💡 Make sure your RapidAPI key is set in .env (or use Attom with --source attom)")
+                    return
+                
+                st.success(f"✅ Found {len(listings)} listings")
+                
+                # Analyze popularity
+                st.markdown("### 📊 Popularity Analysis")
+                
+                # Determine metric based on available data
+                has_views_saves = any(l.get('views') or l.get('saves') for l in listings)
+                popularity_metric = 'composite' if has_views_saves else 'fast_dom'
+                
+                results = popularity_analyzer.analyze_popular_listings(
+                    listings=listings,
+                    top_n=20,
+                    popularity_metric=popularity_metric
+                )
+                
+                # Display top listings
+                st.subheader("🏆 Top Popular Listings")
+                
+                for i, listing in enumerate(results['top_listings'][:10], 1):
+                    with st.expander(f"#{i}: {listing.get('address', 'Unknown')[:60]}...", expanded=(i <= 3)):
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            st.metric("Price", f"${listing.get('price', 0):,}")
+                        with col2:
+                            st.metric("Beds/Baths", f"{listing.get('beds', '?')}/{listing.get('baths', '?')}")
+                        with col3:
+                            st.metric("SqFt", f"{listing.get('sqft', 0):,}")
+                        with col4:
+                            st.metric("Popularity Score", f"{listing['popularity_score']:.2f}")
+                        
+                        # Additional metrics
+                        col5, col6, col7 = st.columns(3)
+                        with col5:
+                            dom = listing.get('days_on_zillow', 'N/A')
+                            st.metric("Days on Zillow", dom if isinstance(dom, int) else 'N/A')
+                        with col6:
+                            views = listing.get('views', 'N/A')
+                            st.metric("Views", views if views else 'N/A')
+                        with col7:
+                            saves = listing.get('saves', 'N/A')
+                            st.metric("Saves", saves if saves else 'N/A')
+                        
+                        # Features
+                        features = listing.get('features', [])
+                        if features:
+                            st.write("**Features:**", ", ".join(features[:10]))
+                        
+                        # Detail URL
+                        if listing.get('detail_url'):
+                            st.markdown(f"[View on Zillow →]({listing['detail_url']})")
+                
+                # Feature analysis
+                if results['feature_analysis'].get('drivers'):
+                    st.subheader("🎯 Popularity Drivers")
+                    st.markdown("Features that appear more frequently in popular listings:")
+                    
+                    drivers = results['feature_analysis']['drivers'][:10]
+                    feature_impact = results['feature_analysis'].get('feature_impact', {})
+                    
+                    for feature in drivers:
+                        impact = feature_impact[feature]
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.write(f"**{feature.title()}**")
+                            st.caption(
+                                f"Appears in {impact['pct_in_top']:.1f}% of top listings "
+                                f"(vs {impact['pct_in_all']:.1f}% overall) - "
+                                f"{impact['impact_ratio']:.1f}x more common"
+                            )
+                        with col2:
+                            if impact['impact_ratio'] >= 2.0:
+                                st.success("🔥 Strong Driver")
+                            elif impact['impact_ratio'] >= 1.5:
+                                st.info("📈 Driver")
+                            else:
+                                st.write("✓")
+                        st.markdown("---")
+                
+                # Price analysis
+                if results['price_analysis']:
+                    st.subheader("💰 Price Analysis")
+                    price_data = results['price_analysis']
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Median Price", f"${price_data.get('median', 0):,}")
+                    with col2:
+                        st.metric("Average Price", f"${price_data.get('mean', 0):,}")
+                    with col3:
+                        st.metric("Price Range", f"${price_data.get('min', 0):,} - ${price_data.get('max', 0):,}")
+                    with col4:
+                        st.metric("Q25-Q75", f"${price_data.get('q25', 0):,} - ${price_data.get('q75', 0):,}")
+                
+                # Configuration analysis
+                if results['config_analysis']:
+                    st.subheader("🏠 Configuration Analysis")
+                    config_data = results['config_analysis']
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**Most Common Configurations:**")
+                        for config, count in list(config_data.get('most_common_configs', {}).items())[:5]:
+                            st.write(f"- {config}: {count} listings")
+                    
+                    with col2:
+                        if config_data.get('avg_sqft'):
+                            st.metric("Avg SqFt", f"{config_data['avg_sqft']:,}")
+                        if config_data.get('avg_price_per_sqft'):
+                            st.metric("Avg $/SqFt", f"${config_data['avg_price_per_sqft']:,}")
+                
+                # Pending analysis (if we have both active and pending)
+                if status == 'pending' and len(listings) > 0:
+                    st.subheader("⏱️ DOM to Pending Analysis")
+                    st.info("💡 For DOM to pending analysis, fetch active listings first, then pending to compare.")
+                    
+                    # Try to analyze if we can
+                    try:
+                        dom_values = [l.get('days_on_zillow') for l in listings if l.get('days_on_zillow')]
+                        if dom_values:
+                            st.write(f"**Median DOM to Pending:** {int(np.median(dom_values))} days")
+                            st.write(f"**Average DOM to Pending:** {np.mean(dom_values):.1f} days")
+                            st.write(f"**Range:** {min(dom_values)} - {max(dom_values)} days")
+                    except:
+                        pass
+                
+                # Store in session state for download
+                st.session_state['listing_analysis_results'] = results
+                st.session_state['listing_data'] = listings
+                
+                # Download button
+                st.markdown("---")
+                if st.button("📥 Download Analysis Results (JSON)", key="download_listing_analysis"):
+                    import json
+                    download_data = {
+                        'analysis': results,
+                        'listings': listings,
+                        'zip_code': zip_code,
+                        'status': status,
+                        'analyzed_at': datetime.now().isoformat()
+                    }
+                    st.download_button(
+                        label="Download JSON",
+                        data=json.dumps(download_data, indent=2, default=str),
+                        file_name=f"listing_analysis_{zip_code}_{status}_{datetime.now().strftime('%Y%m%d')}.json",
+                        mime="application/json"
+                    )
+                
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                st.exception(e)
+    
+    # Show cached results if available
+    if 'listing_analysis_results' in st.session_state:
+        st.markdown("---")
+        st.info("💡 Previous analysis results are cached. Fetch new listings to update.")
+
+
 if __name__ == "__main__":
     main()
+
+
+
+
+
 

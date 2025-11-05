@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     census_api_key: str = Field(default="", env="CENSUS_API_KEY")
     zillow_api_key: str = Field(default="", env="ZILLOW_API_KEY")
     realtor_api_key: str = Field(default="", env="REALTOR_API_KEY")
+    rapidapi_key: str = Field(default="", env="RAPIDAPI_KEY")
     
     # Database (Production)
     database_url: str = Field(
