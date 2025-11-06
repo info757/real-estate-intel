@@ -245,23 +245,47 @@ def engineer_features(listings: list, valid_indices: list) -> pd.DataFrame:
         all_features.update(features.get('exterior', []))
         all_features.update(features.get('upgrades', []))
     
-    # Create binary feature columns
-    feature_columns = {}
+    # Create mapping from original feature to cleaned column name
+    # Use a dict to handle cases where different features map to same column name
+    feature_to_column = {}
+    unique_columns = set()
+    
     for feature in all_features:
         # Clean feature name for column name
         col_name = f"has_{feature.lower().replace(' ', '_').replace('-', '_')[:30]}"
-        feature_columns[col_name] = []
+        # Handle duplicates by appending feature hash if needed
+        original_col_name = col_name
+        counter = 1
+        while col_name in unique_columns:
+            # If column name already exists, make it unique
+            col_name = f"{original_col_name}_{counter}"
+            counter += 1
+        unique_columns.add(col_name)
+        feature_to_column[feature] = col_name
     
-    for listing in valid_listings:
+    # Create binary feature columns (one per unique column name)
+    feature_columns = {col_name: [0] * len(valid_listings) for col_name in unique_columns}
+    
+    # Populate feature columns
+    for i, listing in enumerate(valid_listings):
         features = listing.get('extracted_features', {})
         listing_features = set()
         listing_features.update(features.get('interior', []))
         listing_features.update(features.get('exterior', []))
         listing_features.update(features.get('upgrades', []))
         
-        for feature in all_features:
-            col_name = f"has_{feature.lower().replace(' ', '_').replace('-', '_')[:30]}"
-            feature_columns[col_name].append(1 if feature in listing_features else 0)
+        # Mark features that this listing has
+        for feature in listing_features:
+            if feature in feature_to_column:
+                col_name = feature_to_column[feature]
+                feature_columns[col_name][i] = 1
+    
+    # Verify lengths match before adding to DataFrame
+    expected_len = len(valid_listings)
+    for col_name, values in feature_columns.items():
+        if len(values) != expected_len:
+            logger.error(f"Length mismatch for column {col_name}: {len(values)} != {expected_len}")
+            raise ValueError(f"Feature column {col_name} has wrong length: {len(values)} != {expected_len}")
     
     # Add feature columns to DataFrame
     for col_name, values in feature_columns.items():
