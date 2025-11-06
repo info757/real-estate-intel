@@ -291,7 +291,18 @@ def engineer_features(listings: list, valid_indices: list) -> pd.DataFrame:
     for col_name, values in feature_columns.items():
         df[col_name] = values
     
-    logger.info(f"Engineered {len(df.columns)} features")
+    # Drop non-numeric columns that XGBoost cannot handle
+    # _original_property is stored for extraction but not needed for training
+    columns_to_drop = ['_original_property']
+    
+    # Also drop any other object-type columns (except target variables)
+    for col in df.columns:
+        if df[col].dtype == 'object' and col not in ['y_fast_seller', 'y_dom']:
+            columns_to_drop.append(col)
+    
+    df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
+    
+    logger.info(f"Engineered {len(df.columns)} features (dropped {len(columns_to_drop)} non-numeric columns)")
     return df
 
 
