@@ -50,7 +50,6 @@ class FastSellerModel:
         y_dom: pd.Series,  # Continuous: DOM to pending
         test_size: float = 0.2,
         validation_size: float = 0.2,
-        fast_seller_threshold: int = 14,
         hyperparameter_tuning: bool = True
     ) -> Dict[str, Any]:
         """
@@ -98,14 +97,15 @@ class FastSellerModel:
             hyperparameter_tuning
         )
         
-        # Store metadata
-        self.model_metadata = {
-            'fast_seller_threshold': fast_seller_threshold,
+        # Store metadata (thresholds_by_zip should be set before calling train())
+        if 'thresholds_by_zip' not in self.model_metadata:
+            self.model_metadata['thresholds_by_zip'] = {}
+        self.model_metadata.update({
             'trained_at': datetime.now().isoformat(),
             'feature_count': len(self.feature_names),
             'classifier_metrics': classifier_metrics,
             'regressor_metrics': regressor_metrics
-        }
+        })
         
         return {
             'classifier': classifier_metrics,

@@ -192,9 +192,34 @@ class SafeListingsScraper:
             if status == 'sold':
                 params['status_type'] = 'RecentlySold'
             
+            # Retry logic for rate limits
+            max_retries = 3
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = requests.get(url, headers=headers, params=params, timeout=15)
+                    
+                    # Handle 429 errors with exponential backoff
+                    if response.status_code == 429:
+                        wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
+                        logger.warning(f"Rate limited (429) on page {page}, waiting {wait_time}s before retry {attempt+1}/{max_retries}")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    response.raise_for_status()
+                    break  # Success, exit retry loop
+                except requests.exceptions.RequestException as e:
+                    if attempt == max_retries - 1:
+                        raise  # Last attempt, re-raise
+                    wait_time = (2 ** attempt) * 2
+                    logger.warning(f"Request error on page {page}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+            
+            if response is None:
+                logger.error(f"Failed to fetch page {page} after {max_retries} attempts")
+                break
+            
             try:
-                response = requests.get(url, headers=headers, params=params, timeout=15)
-                response.raise_for_status()
                 
                 data = response.json()
                 
@@ -234,8 +259,8 @@ class SafeListingsScraper:
                 
                 page += 1
                 
-                # Be respectful with rate limiting
-                time.sleep(1)  # Small delay between pages
+                # Optimized for 3 req/sec plan (0.4s = 2.5 req/sec, safe margin)
+                time.sleep(0.4)  # Delay between pages
                 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error fetching page {page}: {e}")
@@ -281,7 +306,8 @@ class SafeListingsScraper:
                     detailed_listings.append({**listing, **detail_data})
                 else:
                     detailed_listings.append(listing)
-                time.sleep(1)
+                # Optimized for 3 req/sec plan (0.4s = 2.5 req/sec, safe margin)
+                time.sleep(0.4)
             except Exception as e:
                 logger.warning(f"Error fetching detail: {e}")
                 detailed_listings.append(listing)
@@ -317,9 +343,35 @@ class SafeListingsScraper:
             'X-RapidAPI-Host': 'zillow-com1.p.rapidapi.com'
         }
         
+        # Retry logic for rate limits
+        max_retries = 3
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=15)
+                
+                # Handle 429 errors with exponential backoff
+                if response.status_code == 429:
+                    wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
+                    logger.warning(f"Rate limited (429) for detail page, waiting {wait_time}s before retry {attempt+1}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                
+                response.raise_for_status()
+                break  # Success, exit retry loop
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    logger.warning(f"Error fetching detail after {max_retries} attempts: {e}")
+                    return None
+                wait_time = (2 ** attempt) * 2
+                logger.warning(f"Request error for detail page, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+        
+        if response is None:
+            logger.warning("Failed to fetch detail page after all retries")
+            return None
+        
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-            response.raise_for_status()
             data = response.json()
             
             return {
@@ -331,7 +383,7 @@ class SafeListingsScraper:
                 'lotSize': data.get('lotSize'),
             }
         except Exception as e:
-            logger.warning(f"Error fetching detail: {e}")
+            logger.warning(f"Error parsing detail response: {e}")
             return None
     
 

@@ -136,7 +136,8 @@ Only include features explicitly mentioned or strongly implied. Be specific and 
     
     def batch_extract_features(
         self,
-        listings: List[Dict[str, Any]]
+        listings: List[Dict[str, Any]],
+        batch_size: int = 15
     ) -> List[Dict[str, Any]]:
         """
         Process multiple listings efficiently.
