@@ -130,6 +130,15 @@ def fetch_sold_listings_with_features(
         all_listings.extend(listings)
 
     logger.info(f"✅ Total listings collected: {len(all_listings)} via {listings_source}")
+    unique_zips = sorted({
+        str(listing.get('zip_code') or listing.get('zipCode') or '')
+        for listing in all_listings
+        if listing.get('zip_code') or listing.get('zipCode')
+    })
+    if unique_zips:
+        logger.info(f"Unique ZIPs discovered in fetched data: {', '.join(unique_zips)}")
+    else:
+        logger.warning("No ZIP codes discovered in fetched listings")
     return all_listings
 
 

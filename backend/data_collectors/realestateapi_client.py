@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path("cache/realestateapi")
 PROPERTY_DETAIL_ENDPOINT = "/v2/property/detail"
-PROPERTY_SEARCH_ENDPOINT = "/v2/property/search"
+PROPERTY_SEARCH_ENDPOINT = "/v2/PropertySearch"
 MLS_DETAIL_ENDPOINT = "/v2/mls/detail"
 DEFAULT_TIMEOUT_SECONDS = 30
 
@@ -331,12 +331,12 @@ class RealEstateAPIClient:
         endpoint: str = PROPERTY_SEARCH_ENDPOINT,
         use_cache: bool = False,
     ) -> Dict[str, Any]:
-        payload = {
-            **filters,
-            "size": page_size,
-            "page": page,
-            "count": include_count,
-        }
+        payload = self._normalize_search_filters(
+            base_filters=filters,
+            page_size=page_size,
+            page=page,
+            include_count=include_count,
+        )
         return self._request("POST", endpoint, payload, use_cache=use_cache)
 
     def search_mls_listings(
@@ -349,30 +349,66 @@ class RealEstateAPIClient:
         endpoint: str = PROPERTY_SEARCH_ENDPOINT,
         **filters: Any,
     ) -> Dict[str, Any]:
-        status_flag = {
-            "active": {"mls_active": True},
-            "pending": {"mls_pending": True},
-            "cancelled": {"mls_cancelled": True},
-            "sold": {"mls_sold": True},
-        }.get(status.lower())
-        if status_flag is None:
-            raise ValueError(f"Unsupported MLS status '{status}'.")
-
-        if "page_size" in filters:
-            filters["size"] = filters.pop("page_size")
-        filters.setdefault("size", 250)
-        filters.setdefault("page", 1)
-        filters.setdefault("count", False)
-
-        payload: Dict[str, Any] = {**status_flag, **filters}
-        if geography:
-            payload.update(geography)
-        if price_min is not None:
-            payload["mls_listing_min"] = price_min
-        if price_max is not None:
-            payload["mls_listing_max"] = price_max
-
+        payload = self._normalize_search_filters(
+            base_filters=filters,
+            status=status,
+            geography=geography,
+            price_min=price_min,
+            price_max=price_max,
+        )
         return self._request("POST", endpoint, payload)
+
+    def _normalize_search_filters(
+        self,
+        *,
+        base_filters: Dict[str, Any],
+        status: Optional[str] = None,
+        geography: Optional[Dict[str, Any]] = None,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
+        page_size: Optional[int] = None,
+        page: Optional[int] = None,
+        include_count: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+
+        if include_count is not None:
+            payload["count"] = include_count
+        if page_size is not None:
+            payload["size"] = page_size
+
+        if geography:
+            for key, value in geography.items():
+                if value and key not in payload:
+                    payload[key] = value
+
+        conditions = payload.setdefault("and", [])
+
+        if status:
+            status_lower = status.lower()
+            if status_lower in {"active", "pending", "cancelled", "sold"}:
+                conditions.append({"status": {"equals": status_lower.upper()}})
+            else:
+                raise ValueError(f"Unsupported MLS status '{status}'.")
+
+        if price_min is not None or price_max is not None:
+            price_filter: Dict[str, Any] = {}
+            if price_min is not None:
+                price_filter["from"] = price_min
+            if price_max is not None:
+                price_filter["to"] = price_max
+            conditions.append({"current_price": price_filter})
+
+        for key, value in (base_filters or {}).items():
+            if key in {"and", "or"} and isinstance(value, list):
+                payload.setdefault(key, []).extend(value)
+            elif key == "filters" and isinstance(value, dict):
+                for filter_key, filter_value in value.items():
+                    conditions.append({filter_key: filter_value})
+            else:
+                payload[key] = value
+
+        return payload
 
     def get_property_detail(
         self,

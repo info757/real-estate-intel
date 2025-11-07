@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
+from pathlib import Path
+import json
 
 from config.settings import settings
 from backend.data_collectors.realestateapi_client import (
@@ -18,6 +20,9 @@ from backend.data_collectors.realestateapi_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+CACHE_ROOT = Path("cache/listings/realestateapi")
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _first(items: Iterable[Any], predicate) -> Optional[Any]:
@@ -60,26 +65,35 @@ class RealEstateApiListingLoader:
             and media metadata.
         """
 
+        search_end = datetime.utcnow().strftime("%Y-%m-%d")
         search_start = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         listings: List[Dict[str, Any]] = []
-        page = 1
         page_size = min(max_results, 250)
+        result_index = 0
 
         while len(listings) < max_results:
-            response = self.client.search_mls_listings(
-                status="sold",
-                geography={"zip": zip_code},
-                list_date_min=search_start,
-                status_date_min=search_start,
-                page=page,
+            response = self.client.search_properties(
+                filters={
+                    "zip": zip_code,
+                    "resultIndex": result_index,
+                    "and": [
+                        {"status": {"equals": "SOLD"}},
+                        {"sale_date": {"between": [search_start, search_end]}}
+                    ]
+                },
                 page_size=page_size,
+                include_count=False,
             )
 
             records = self._extract_records(response)
             if not records:
                 break
 
-            logger.info("RealEstateApi returned %d sold records on page %d", len(records), page)
+            logger.info(
+                "RealEstateApi returned %d sold records starting at index %d",
+                len(records),
+                result_index,
+            )
 
             for record in records:
                 normalized = self._normalize_search_record(record)
@@ -91,12 +105,23 @@ class RealEstateApiListingLoader:
                 if len(listings) >= max_results:
                     break
 
-            if not self._has_next_page(response, page):
+            next_index = response.get("resultIndex")
+            total_count = response.get("resultCount")
+            if next_index is None or total_count is None or next_index >= total_count:
                 break
-            page += 1
+            result_index = next_index
 
         logger.info("Collected %d sold listings for %s", len(listings), zip_code)
+        self._persist_cache(zip_code, days_back, listings)
         return listings
+
+    def _persist_cache(self, zip_code: str, days_back: int, listings: List[Dict[str, Any]]):
+        cache_file = CACHE_ROOT / f"listings_{zip_code}_{days_back}days.json"
+        try:
+            with cache_file.open("w", encoding="utf-8") as fh:
+                json.dump(listings, fh, indent=2, default=str)
+        except Exception as exc:
+            logger.warning("Failed to write cache for %s: %s", zip_code, exc)
 
     # ------------------------------------------------------------------
     # Normalization helpers
