@@ -18,7 +18,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+from config.settings import settings
 from backend.data_collectors.safe_listings_scraper import SafeListingsScraper
+from backend.data_collectors.realestateapi_loader import RealEstateApiListingLoader
 from backend.analyzers.sold_listings_analyzer import SoldListingsAnalyzer
 from backend.ml.feature_extractor import FeatureExtractor
 from backend.ml.feature_engineering import FeatureEngineer
@@ -31,15 +33,15 @@ logger = logging.getLogger(__name__)
 
 
 
-def get_cache_path(zip_code: str, days_back: int) -> Path:
-    """Get cache file path for a ZIP code."""
-    cache_dir = Path("cache/listings")
+def get_cache_path(zip_code: str, days_back: int, source: str) -> Path:
+    """Get cache file path for a ZIP code and source."""
+    cache_dir = Path("cache/listings") / source
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / f"listings_{zip_code}_{days_back}days.json"
 
-def load_cached_listings(zip_code: str, days_back: int) -> Optional[List[Dict[str, Any]]]:
+def load_cached_listings(zip_code: str, days_back: int, source: str) -> Optional[List[Dict[str, Any]]]:
     """Load cached listings if available."""
-    cache_path = get_cache_path(zip_code, days_back)
+    cache_path = get_cache_path(zip_code, days_back, source)
     if cache_path.exists():
         try:
             with open(cache_path, 'r') as f:
@@ -48,13 +50,13 @@ def load_cached_listings(zip_code: str, days_back: int) -> Optional[List[Dict[st
             logger.warning(f"Failed to load cache for {zip_code}: {e}")
     return None
 
-def save_cached_listings(zip_code: str, days_back: int, listings: List[Dict[str, Any]]):
+def save_cached_listings(zip_code: str, days_back: int, listings: List[Dict[str, Any]], source: str):
     """Save listings to cache."""
-    cache_path = get_cache_path(zip_code, days_back)
+    cache_path = get_cache_path(zip_code, days_back, source)
     try:
         with open(cache_path, 'w') as f:
             json.dump(listings, f, indent=2, default=str)
-        logger.info(f"Cached {len(listings)} listings for {zip_code}")
+        logger.info(f"Cached {len(listings)} listings for {zip_code} [{source}]")
     except Exception as e:
         logger.warning(f"Failed to save cache for {zip_code}: {e}")
 
@@ -67,60 +69,67 @@ def fetch_sold_listings_with_features(
     parallel: bool = False  # Sequential to avoid rate limits
 ) -> list:
     """Fetch sold listings, extract features, and calculate DOM metrics."""
-    scraper = SafeListingsScraper()
+    listings_source = getattr(settings, 'listings_source', 'rapidapi').lower()
+    use_realestateapi = listings_source == 'realestateapi'
+
+    scraper = None
+    loader = None
+
+    if use_realestateapi:
+        loader = RealEstateApiListingLoader()
+    else:
+        scraper = SafeListingsScraper()
+
     analyzer = SoldListingsAnalyzer()
     extractor = FeatureExtractor()
-    
+
     all_listings = []
-    
+
     def process_zip(zip_code: str) -> List[Dict[str, Any]]:
         """Process a single ZIP code."""
+        source_tag = listings_source
         # Check cache first
         if use_cache:
-            cached = load_cached_listings(zip_code, days_back)
+            cached = load_cached_listings(zip_code, days_back, source_tag)
             if cached:
-                logger.info(f"✅ Loaded {len(cached)} cached listings for ZIP {zip_code}")
+                logger.info(f"✅ Loaded {len(cached)} cached listings for ZIP {zip_code} [{source_tag}]")
                 return cached
-        
-        logger.info(f"Fetching sold listings for ZIP {zip_code}...")
-        listings = scraper.fetch_sold_with_details(
-            zip_code=zip_code,
-            days_back=days_back,
-            max_results=max_per_zip,
-            fetch_details=True
-        )
-        
+
+        logger.info(f"Fetching sold listings for ZIP {zip_code} via {source_tag}...")
+        if use_realestateapi:
+            listings = loader.fetch_sold_with_details(
+                zip_code=zip_code,
+                days_back=days_back,
+                max_results=max_per_zip,
+                include_mls_detail=True,
+            )
+        else:
+            listings = scraper.fetch_sold_with_details(
+                zip_code=zip_code,
+                days_back=days_back,
+                max_results=max_per_zip,
+                fetch_details=True
+            )
+
         # Calculate DOM metrics
         listings = analyzer.calculate_dom_metrics(listings)
-        
+
         # Extract features from descriptions (with batching)
         listings = extractor.batch_extract_features(listings, batch_size=15)
-        
+
         # Cache results
         if use_cache:
-            save_cached_listings(zip_code, days_back, listings)
-        
-        logger.info(f"✅ Collected {len(listings)} listings from ZIP {zip_code}")
+            save_cached_listings(zip_code, days_back, listings, source_tag)
+
+        logger.info(f"✅ Collected {len(listings)} listings from ZIP {zip_code} [{source_tag}]")
         return listings
-    
-    # Process ZIPs sequentially to avoid rate limits
-    if False and parallel and len(zip_codes) > 1:  # Disabled parallel to avoid rate limits
-        logger.info(f"Processing {len(zip_codes)} ZIPs in parallel...")
-        with ThreadPoolExecutor(max_workers=3) as executor:  # Limit to 3 to respect rate limits
-            futures = {executor.submit(process_zip, zip_code): zip_code for zip_code in zip_codes}
-            for future in as_completed(futures):
-                zip_code = futures[future]
-                try:
-                    listings = future.result()
-                    all_listings.extend(listings)
-                except Exception as e:
-                    logger.error(f"Error processing ZIP {zip_code}: {e}")
-    else:
-        for zip_code in zip_codes:
-            listings = process_zip(zip_code)
-            all_listings.extend(listings)
-    
-    logger.info(f"✅ Total listings collected: {len(all_listings)}")
+
+    # Process ZIPs sequentially to avoid rate limits / request caps
+    for zip_code in zip_codes:
+        listings = process_zip(zip_code)
+        all_listings.extend(listings)
+
+    logger.info(f"✅ Total listings collected: {len(all_listings)} via {listings_source}")
     return all_listings
 
 

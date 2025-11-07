@@ -358,6 +358,12 @@ class RealEstateAPIClient:
         if status_flag is None:
             raise ValueError(f"Unsupported MLS status '{status}'.")
 
+        if "page_size" in filters:
+            filters["size"] = filters.pop("page_size")
+        filters.setdefault("size", 250)
+        filters.setdefault("page", 1)
+        filters.setdefault("count", False)
+
         payload: Dict[str, Any] = {**status_flag, **filters}
         if geography:
             payload.update(geography)
