@@ -197,8 +197,40 @@ def prepare_targets(listings: list, thresholds_by_zip: dict) -> tuple:
     
     # Get overall median as fallback for listings without ZIP match
     import statistics
+    from collections import defaultdict
     all_doms = [l.get('dom_to_pending') for l in listings if l.get('dom_to_pending') is not None and l.get('dom_to_pending') >= 0]
     overall_median = statistics.median(all_doms) if all_doms else 30.0
+    
+    # Prepare DOM distributions per ZIP for quantile-based smoothing
+    doms_by_zip: Dict[str, List[float]] = defaultdict(list)
+    for listing in listings:
+        dom = listing.get('dom_to_pending')
+        if dom is None or dom < 0:
+            continue
+        zip_code = listing.get('zip_code') or listing.get('zipCode')
+        if not zip_code and listing.get('address'):
+            import re
+            zip_match = re.search(r'\b(\d{5})\b', listing.get('address', ''))
+            zip_code = zip_match.group(1) if zip_match else None
+        if zip_code:
+            doms_by_zip[str(zip_code)].append(dom)
+    
+    import numpy as np
+    if all_doms:
+        global_lower = float(np.percentile(all_doms, 5))
+        global_upper = float(np.percentile(all_doms, 95))
+    else:
+        global_lower, global_upper = 0.0, 90.0
+    
+    dom_quantiles_by_zip: Dict[str, tuple[float, float]] = {}
+    for zip_code, dom_list in doms_by_zip.items():
+        if len(dom_list) >= 8:
+            dom_quantiles_by_zip[zip_code] = (
+                float(np.percentile(dom_list, 5)),
+                float(np.percentile(dom_list, 95))
+            )
+        else:
+            dom_quantiles_by_zip[zip_code] = (global_lower, global_upper)
     
     for i, listing in enumerate(listings):
         dom = listing.get('dom_to_pending')
@@ -213,10 +245,12 @@ def prepare_targets(listings: list, thresholds_by_zip: dict) -> tuple:
         if dom is not None and dom >= 0:
             # Get ZIP-specific threshold, fallback to overall median
             threshold = thresholds_by_zip.get(str(zip_code), overall_median) if zip_code else overall_median
+            low_q, high_q = dom_quantiles_by_zip.get(str(zip_code), (global_lower, global_upper))
+            dom_clipped = float(np.clip(dom, low_q, high_q))
             
             # Fast seller = DOM < median for that ZIP (fastest 50%)
             y_fast_seller.append(1 if dom < threshold else 0)
-            y_dom.append(dom)
+            y_dom.append(dom_clipped)
             valid_indices.append(i)
     
     logger.info(f"Valid samples: {len(valid_indices)}/{len(listings)}")
@@ -233,63 +267,17 @@ def engineer_features(listings: list, valid_indices: list) -> pd.DataFrame:
     # Filter to valid listings
     valid_listings = [listings[i] for i in valid_indices]
     
-    # Engineer features
-    df = engineer.engineer_features(valid_listings)
+    # Gather LLM extracted features if present
+    extracted_features_list = [
+        listing.get('extracted_features', {}) for listing in valid_listings
+    ]
     
-    # Add LLM-extracted features as binary flags
-    # Get all unique features across listings
-    all_features = set()
-    for listing in valid_listings:
-        features = listing.get('extracted_features', {})
-        all_features.update(features.get('interior', []))
-        all_features.update(features.get('exterior', []))
-        all_features.update(features.get('upgrades', []))
-    
-    # Create mapping from original feature to cleaned column name
-    # Use a dict to handle cases where different features map to same column name
-    feature_to_column = {}
-    unique_columns = set()
-    
-    for feature in all_features:
-        # Clean feature name for column name
-        col_name = f"has_{feature.lower().replace(' ', '_').replace('-', '_')[:30]}"
-        # Handle duplicates by appending feature hash if needed
-        original_col_name = col_name
-        counter = 1
-        while col_name in unique_columns:
-            # If column name already exists, make it unique
-            col_name = f"{original_col_name}_{counter}"
-            counter += 1
-        unique_columns.add(col_name)
-        feature_to_column[feature] = col_name
-    
-    # Create binary feature columns (one per unique column name)
-    feature_columns = {col_name: [0] * len(valid_listings) for col_name in unique_columns}
-    
-    # Populate feature columns
-    for i, listing in enumerate(valid_listings):
-        features = listing.get('extracted_features', {})
-        listing_features = set()
-        listing_features.update(features.get('interior', []))
-        listing_features.update(features.get('exterior', []))
-        listing_features.update(features.get('upgrades', []))
-        
-        # Mark features that this listing has
-        for feature in listing_features:
-            if feature in feature_to_column:
-                col_name = feature_to_column[feature]
-                feature_columns[col_name][i] = 1
-    
-    # Verify lengths match before adding to DataFrame
-    expected_len = len(valid_listings)
-    for col_name, values in feature_columns.items():
-        if len(values) != expected_len:
-            logger.error(f"Length mismatch for column {col_name}: {len(values)} != {expected_len}")
-            raise ValueError(f"Feature column {col_name} has wrong length: {len(values)} != {expected_len}")
-    
-    # Add feature columns to DataFrame
-    for col_name, values in feature_columns.items():
-        df[col_name] = values
+    # Engineer features using the fast-seller specific pipeline
+    df = engineer.engineer_features_for_fast_seller(
+        valid_listings,
+        market_context=None,
+        extracted_features_list=extracted_features_list
+    )
     
     # Drop non-numeric columns that XGBoost cannot handle
     # _original_property is stored for extraction but not needed for training

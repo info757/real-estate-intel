@@ -163,7 +163,8 @@ class SafeListingsScraper:
         self,
         zip_code: str,
         status: str,
-        max_results: int
+        max_results: int,
+        location_override: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Fetch listings via RapidAPI Zillow wrapper with pagination support."""
         if not self.rapidapi_key:
@@ -180,9 +181,10 @@ class SafeListingsScraper:
         page = 1
         results_per_page = 50  # API seems to return max 41-50 per page
         
+        location_param = location_override or zip_code
         while len(listings) < max_results:
             params = {
-                'location': zip_code,
+                'location': location_param,
                 'home_type': 'Houses',  # Can be expanded to include condos, etc.
                 'limit': results_per_page,
                 'page': page
@@ -286,6 +288,26 @@ class SafeListingsScraper:
         sold_listings = self._fetch_zillow_rapidapi(
             zip_code=zip_code, status='sold', max_results=max_results
         )
+        if not sold_listings:
+            fallback_location = self._infer_fallback_location(zip_code)
+            if fallback_location:
+                logger.info(
+                    f"No direct results for ZIP {zip_code}. Attempting city-level search for {fallback_location}"
+                )
+                broad_results = self._fetch_zillow_rapidapi(
+                    zip_code=zip_code,
+                    status='sold',
+                    max_results=max_results * 5,
+                    location_override=fallback_location
+                )
+                filtered = []
+                for listing in broad_results:
+                    listing_zip = str(listing.get('zip_code') or '').strip()
+                    if listing_zip == str(zip_code):
+                        filtered.append(listing)
+                    if len(filtered) >= max_results:
+                        break
+                sold_listings = filtered
         
         if not fetch_details:
             return sold_listings
@@ -313,6 +335,12 @@ class SafeListingsScraper:
                 detailed_listings.append(listing)
         
         return detailed_listings
+
+    def _infer_fallback_location(self, zip_code: str) -> Optional[str]:
+        """Infer a broader location (city/state) for a given ZIP code."""
+        if zip_code.startswith('274'):
+            return 'Greensboro, NC'
+        return None
     
     def _fetch_listing_detail(
         self,

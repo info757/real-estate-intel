@@ -46,11 +46,16 @@ class FeatureEngineer:
             row = {}
             # Extract sale_price from nested structure
             sale_price = self._safe_get(prop, ['sale', 'amount', 'saleamt'])
-            sale_date = self._safe_get(prop, ['sale', 'saleTransDate'])
+            sale_date = self._safe_get(prop, ['sale', 'saleTransDate']) or prop.get('dateSold')
             
             # Extract other nested fields
             row['sale_price'] = sale_price
             row['sale_date'] = sale_date
+            row['list_date'] = prop.get('listing_date') or prop.get('list_date')
+            row['pending_date'] = prop.get('pending_date')
+            row['dom_to_pending'] = prop.get('dom_to_pending')
+            row['dom_to_sold'] = prop.get('dom_to_sold')
+            row['pending_to_sold'] = prop.get('pending_to_sold')
             
             # Flatten common fields
             row['beds'] = self._safe_get(prop, ['building', 'rooms', 'beds']) or self._safe_get(prop, ['summary', 'beds'])
@@ -86,6 +91,9 @@ class FeatureEngineer:
         
         # Location features
         df = self._create_location_features(df)
+        
+        # Market-normalized features
+        df = self._create_zip_normalized_features(df)
         
         # Quality/condition features
         df = self._create_quality_features(df)
@@ -139,7 +147,11 @@ class FeatureEngineer:
             )
         
         # Convert to numeric where appropriate
-        numeric_cols = ['beds', 'baths', 'sqft', 'lot_size_acres', 'lot_size_sqft', 'year_built', 'stories', 'sale_price']
+        numeric_cols = [
+            'beds', 'baths', 'sqft', 'lot_size_acres', 'lot_size_sqft',
+            'year_built', 'stories', 'sale_price', 'dom_to_pending',
+            'dom_to_sold', 'pending_to_sold'
+        ]
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
@@ -259,6 +271,31 @@ class FeatureEngineer:
         df['inventory_level_encoded'] = inventory_map.get(
             competitive_context.get('inventory_level', 'medium'), 1
         )
+        
+        return df
+
+    def _create_zip_normalized_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create features normalized by ZIP-level market stats."""
+        if 'zip_code' not in df.columns:
+            return df
+        
+        zip_series = df['zip_code'].astype(str).str.extract(r'(\d{5})')[0]
+        df['zip_code'] = zip_series.fillna(df['zip_code'])
+        
+        # Median sale price per ZIP
+        if 'sale_price' in df.columns:
+            df['zip_sale_price_median'] = df.groupby('zip_code')['sale_price'].transform('median')
+            df['price_to_zip_median'] = df['sale_price'] / df['zip_sale_price_median'].replace(0, np.nan)
+            df['is_above_zip_median_price'] = (df['price_to_zip_median'] > 1.1).astype(float)
+            df['is_below_zip_median_price'] = (df['price_to_zip_median'] < 0.9).astype(float)
+        
+        if 'price_per_sqft' in df.columns:
+            df['zip_price_per_sqft_median'] = df.groupby('zip_code')['price_per_sqft'].transform('median')
+            df['price_per_sqft_to_zip'] = df['price_per_sqft'] / df['zip_price_per_sqft_median'].replace(0, np.nan)
+        
+        if 'sqft' in df.columns:
+            df['zip_sqft_median'] = df.groupby('zip_code')['sqft'].transform('median')
+            df['sqft_to_zip_median'] = df['sqft'] / df['zip_sqft_median'].replace(0, np.nan)
         
         return df
     
@@ -424,6 +461,21 @@ class FeatureEngineer:
         df = self._create_pricing_strategy_features(df, market_context)
         df = self._create_timing_features(df, date_column='list_date')
         df = self._create_llm_extracted_features(df, extracted_features_list)
+        
+        # Remove leakage-prone target columns before modeling
+        leakage_columns = [
+            'dom_to_pending',
+            'dom_to_sold',
+            'pending_to_sold',
+            'dom_relative_to_zip',
+            'zip_dom_median',
+            'zip_dom_p90'
+        ]
+        df = df.drop(columns=[col for col in leakage_columns if col in df.columns], errors='ignore')
+
+        # Keep only numeric features for modeling
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        df = df[numeric_cols].copy()
         
         return df
 

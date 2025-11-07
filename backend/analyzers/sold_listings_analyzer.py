@@ -65,9 +65,14 @@ class SoldListingsAnalyzer:
         # Calculate DOM metrics
         if timeline['listing_date']:
             if timeline['pending_date']:
-                timeline['dom_to_pending'] = (timeline['pending_date'] - timeline['listing_date']).days
+                dom_to_pending = (timeline['pending_date'] - timeline['listing_date']).days
+                # Guard against negative or obviously bad values
+                if dom_to_pending is not None and dom_to_pending >= 0:
+                    timeline['dom_to_pending'] = dom_to_pending
             if timeline['sold_date']:
-                timeline['dom_to_sold'] = (timeline['sold_date'] - timeline['listing_date']).days
+                dom_to_sold = (timeline['sold_date'] - timeline['listing_date']).days
+                if dom_to_sold is not None and dom_to_sold >= 0:
+                    timeline['dom_to_sold'] = dom_to_sold
         
         if timeline['pending_date'] and timeline['sold_date']:
             timeline['pending_to_sold'] = (timeline['sold_date'] - timeline['pending_date']).days
