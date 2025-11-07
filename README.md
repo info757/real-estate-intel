@@ -85,6 +85,11 @@ docker run -p 6333:6333 qdrant/qdrant
 streamlit run prototype/app.py
 ```
 
+## Branch Strategy & Demo Freeze
+
+- `main` is frozen for the upcoming demo; only ship critical demo-blocking fixes directly here.
+- Use `feature/realestateapi-integration` for the RealEstateApi MCP workstream. Create child branches off it as needed, then merge via PRs back into the integration branch before promoting to `main`.
+
 ## Data Sources
 
 ### Free APIs
