@@ -281,6 +281,7 @@ class FeatureEngineer:
         
         zip_series = df['zip_code'].astype(str).str.extract(r'(\d{5})')[0]
         df['zip_code'] = zip_series.fillna(df['zip_code'])
+        df['zip_numeric'] = pd.to_numeric(df['zip_code'], errors='coerce')
         
         # Median sale price per ZIP
         if 'sale_price' in df.columns:

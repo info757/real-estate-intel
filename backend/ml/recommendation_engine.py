@@ -470,7 +470,15 @@ class RecommendationEngine:
                 try:
                     if fast_seller_model.fast_seller_classifier is not None:
                         fast_seller_prob = fast_seller_model.predict_fast_seller_probability(feature_vector)[0]
-                        fast_seller_dom = fast_seller_model.predict_dom(feature_vector)[0]
+                        lot_zip = (
+                            lot_features.get('zip_code')
+                            or lot_features.get('postal_code')
+                            or lot_features.get('zipCode')
+                        )
+                        fast_seller_dom = fast_seller_model.predict_dom(
+                            feature_vector,
+                            zip_codes=[lot_zip]
+                        )[0]
                         logger.debug(f"Fast-seller prob: {fast_seller_prob:.3f}, DOM: {fast_seller_dom:.1f}")
                 except Exception as e:
                     logger.warning(f"Fast-seller prediction failed: {e}")

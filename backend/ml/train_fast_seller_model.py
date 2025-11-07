@@ -8,6 +8,7 @@ import logging
 import pandas as pd
 import numpy as np
 import json
+import re
 from typing import List, Dict, Any, Optional
 import time
 from datetime import datetime, timedelta
@@ -325,6 +326,29 @@ def train_fast_seller_model(
     
     # Prepare targets using ZIP-specific thresholds
     y_fast_seller, y_dom, valid_indices = prepare_targets(listings, thresholds_by_zip)
+    from collections import defaultdict
+    dom_values_by_zip = defaultdict(list)
+    for idx in valid_indices:
+        listing = listings[idx]
+        dom_value = listing.get('dom_to_pending')
+        if dom_value is None or dom_value < 0:
+            continue
+        zip_code = listing.get('zip_code') or listing.get('zipCode')
+        if not zip_code and listing.get('address'):
+            import re
+            zip_match = re.search(r'\b(\d{5})\b', listing.get('address', ''))
+            zip_code = zip_match.group(1) if zip_match else None
+        if zip_code:
+            dom_values_by_zip[str(zip_code)].append(dom_value)
+    dom_stats_by_zip = {}
+    for zip_code, dom_list in dom_values_by_zip.items():
+        arr = np.array(dom_list)
+        dom_stats_by_zip[zip_code] = {
+            'count': int(len(arr)),
+            'median': float(np.median(arr)),
+            'p75': float(np.percentile(arr, 75)),
+            'p90': float(np.percentile(arr, 90))
+        }
     
     if len(valid_indices) < 50:
         raise ValueError(f"Insufficient valid samples: {len(valid_indices)}. Need at least 50.")
@@ -343,6 +367,12 @@ def train_fast_seller_model(
     model.model_metadata['threshold_method'] = 'median_dom_per_zip'
     model.model_metadata['threshold_description'] = 'Fast sellers = DOM < median DOM for that ZIP (fastest 50%)'
     
+    model.model_metadata['dom_stats_by_zip'] = dom_stats_by_zip
+    model.model_metadata['dom_global_median'] = float(np.median(y_dom))
+    model.model_metadata['dom_global_p75'] = float(np.percentile(y_dom, 75))
+    model.model_metadata['dom_global_p90'] = float(np.percentile(y_dom, 90))
+    model.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+
     metrics = model.train(
         X=X,
         y_fast_seller=y_fast_seller,
@@ -412,8 +442,14 @@ if __name__ == '__main__':
             save_models=not args.no_save
         )
         
-        logger.info(f"\nClassifier AUC: {results['metrics']['classifier']['test_auc']:.3f}")
-        logger.info(f"Regressor MAPE: {results['metrics']['regressor']['test_mape']:.2f}%")
+        clf_auc = results['metrics']['classifier'].get('test_auc')
+        if clf_auc is not None:
+            logger.info(f"\nClassifier AUC: {clf_auc:.3f}")
+        reg_metrics = results['metrics']['regressor']
+        if reg_metrics.get('test_mape') is not None:
+            logger.info(f"Regressor MAPE: {reg_metrics['test_mape']:.2f}%")
+        else:
+            logger.info("DOM predictions use median-by-ZIP heuristic (no MAPE computed)")
         
     except Exception as e:
         logger.error(f"Training failed: {e}")

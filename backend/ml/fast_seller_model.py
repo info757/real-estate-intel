@@ -104,14 +104,15 @@ class FastSellerModel:
             hyperparameter_tuning
         )
         
-        # Train DOM regressor
-        logger.info("Training DOM regressor...")
-        regressor_metrics = self._train_dom_regressor(
-            X_train, y_dom_log_train, y_dom_train_orig,
-            X_val, y_dom_log_val, y_dom_val_orig,
-            X_test, y_dom_log_test, y_dom_test_orig,
-            hyperparameter_tuning
-        )
+        logger.info("Skipping DOM regressor training; using heuristic DOM statistics")
+        self.dom_regressor = None
+        regressor_metrics = {
+            'strategy': 'zip_median_heuristic',
+            'test_mae': None,
+            'test_mape': None,
+            'test_r2': None,
+            'test_rmse': None
+        }
         
         # Store metadata (thresholds_by_zip should be set before calling train())
         if 'thresholds_by_zip' not in self.model_metadata:
@@ -121,7 +122,7 @@ class FastSellerModel:
             'feature_count': len(self.feature_names),
             'classifier_metrics': classifier_metrics,
             'regressor_metrics': regressor_metrics,
-            'target_transform': 'log1p_dom'
+            'target_transform': 'zip_median_heuristic'
         })
         
         return {
@@ -353,15 +354,62 @@ class FastSellerModel:
         X = X.fillna(0)
         return self.fast_seller_classifier.predict_proba(X)[:, 1]
     
-    def predict_dom(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_dom(
+        self,
+        X: pd.DataFrame,
+        zip_codes: Optional[List[Any]] = None
+    ) -> np.ndarray:
         """Predict DOM to pending."""
         if self.dom_regressor is None:
-            raise ValueError("Model not trained. Call train() first.")
+            return self._predict_dom_with_stats(zip_codes, len(X))
         
         X = X.fillna(0)
         preds_log = self.dom_regressor.predict(X)
+        if 'dom_log_range' in self.model_metadata:
+            log_bounds = self.model_metadata['dom_log_range']
+            preds_log = np.clip(
+                preds_log,
+                log_bounds.get('min', np.min(preds_log)),
+                log_bounds.get('max', np.max(preds_log))
+            )
         preds = np.expm1(preds_log)
-        return np.clip(preds, 0, None)
+        preds = np.clip(preds, 0, None)
+        if zip_codes is not None:
+            stats = self.model_metadata.get('dom_stats_by_zip', {})
+            global_cap = self.model_metadata.get('dom_global_p90', None)
+            adjusted = []
+            for pred, zip_code in zip(preds, zip_codes):
+                key = str(zip_code) if zip_code is not None else None
+                stat = stats.get(key, {})
+                cap = stat.get('p90', global_cap)
+                median = stat.get('median', self.model_metadata.get('dom_global_median', pred))
+                value = pred
+                if cap is not None:
+                    value = min(value, cap)
+                if value <= 0 and median is not None:
+                    value = median
+                adjusted.append(value)
+            preds = np.array(adjusted, dtype=float)
+        return preds
+
+    def _predict_dom_with_stats(
+        self,
+        zip_codes: Optional[List[Any]],
+        length: int
+    ) -> np.ndarray:
+        stats = self.model_metadata.get('dom_stats_by_zip', {})
+        global_median = self.model_metadata.get('dom_global_median', 30.0)
+        if zip_codes is None:
+            return np.full(length, global_median, dtype=float)
+        values = []
+        for zip_code in zip_codes:
+            key = str(zip_code) if zip_code is not None else None
+            stat = stats.get(key)
+            if stat and stat.get('median') is not None:
+                values.append(stat['median'])
+            else:
+                values.append(global_median)
+        return np.array(values, dtype=float)
     
     def get_feature_importance(self, model_type: str = 'classifier') -> Dict[str, float]:
         """Get feature importance rankings."""
