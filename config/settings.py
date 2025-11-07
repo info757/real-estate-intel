@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     zillow_api_key: str = Field(default="", env="ZILLOW_API_KEY")
     realtor_api_key: str = Field(default="", env="REALTOR_API_KEY")
     rapidapi_key: str = Field(default="", env="RAPIDAPI_KEY")
+    realestateapi_api_key: str = Field(default="", env="REALESTATEAPI_API_KEY")
+    realestateapi_base_url: str = Field(default="https://api.realestateapi.com", env="REALESTATEAPI_BASE_URL")
+    realestateapi_mcp_url: str = Field(default="https://mcp.realestateapi.com/sse", env="REALESTATEAPI_MCP_URL")
+    realestateapi_developer_mcp_url: str = Field(
+        default="https://developer.mcp.realestateapi.com/sse", env="REALESTATEAPI_DEVELOPER_MCP_URL"
+    )
+    use_realestateapi_mcp: bool = Field(default=False, env="USE_REALESTATEAPI_MCP")
+    listings_source: str = Field(default="rapidapi", env="LISTINGS_SOURCE")
     
     # Database (Production)
     database_url: str = Field(

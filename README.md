@@ -102,6 +102,7 @@ streamlit run prototype/app.py
 - **GreatSchools API**: School ratings and data
 - **Zillow API**: Real estate listings and pricing
 - **Attom Data**: Property data and analytics
+- **RealEstateApi (MLS)**: Live MLS listings, DOM timelines, and rich property detail via MCP
 
 ### Web Scraping
 - Zillow, Realtor.com, LandWatch, Lands of America
