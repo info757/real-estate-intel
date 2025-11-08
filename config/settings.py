@@ -38,6 +38,9 @@ class Settings(BaseSettings):
         default="https://developer.mcp.realestateapi.com/sse", env="REALESTATEAPI_DEVELOPER_MCP_URL"
     )
     use_realestateapi_mcp: bool = Field(default=False, env="USE_REALESTATEAPI_MCP")
+    realestateapi_max_results_per_zip: int = Field(
+        default=6000, env="REALESTATEAPI_MAX_RESULTS_PER_ZIP"
+    )
     listings_source: str = Field(default="rapidapi", env="LISTINGS_SOURCE")
     
     # Database (Production)
