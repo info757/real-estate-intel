@@ -182,22 +182,30 @@ class FeatureEngineer:
     def _create_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create time-based features."""
         current_year = datetime.now().year
-        
+
         # Age of property
         df['age_years'] = current_year - df['year_built']
-        
+
         # Sale date features
-        df['sale_date_dt'] = pd.to_datetime(df['sale_date'], errors='coerce')
+        sale_dates = pd.to_datetime(df['sale_date'], errors='coerce', utc=True)
+        df['sale_date_dt'] = sale_dates.dt.tz_localize(None)
         df['sale_year'] = df['sale_date_dt'].dt.year
         df['sale_month'] = df['sale_date_dt'].dt.month
         df['sale_quarter'] = df['sale_date_dt'].dt.quarter
-        
+        sale_month_angle = 2 * np.pi * ((df['sale_month'].fillna(1) - 1) / 12.0)
+        df['sale_month_sin'] = np.sin(sale_month_angle)
+        df['sale_month_cos'] = np.cos(sale_month_angle)
+        sale_quarter_angle = 2 * np.pi * ((df['sale_quarter'].fillna(1) - 1) / 4.0)
+        df['sale_quarter_sin'] = np.sin(sale_quarter_angle)
+        df['sale_quarter_cos'] = np.cos(sale_quarter_angle)
+
         # Seasonality (spring selling season = higher prices?)
         df['is_spring_summer'] = df['sale_month'].isin([3, 4, 5, 6, 7, 8]).astype(int)
-        
+
         # Days since sale (for temporal modeling)
-        df['days_since_sale'] = (datetime.now() - df['sale_date_dt']).dt.days
-        
+        current_ts = pd.Timestamp.utcnow().tz_localize(None)
+        df['days_since_sale'] = (current_ts - df['sale_date_dt']).dt.days
+
         return df
     
     def _create_location_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -384,6 +392,12 @@ class FeatureEngineer:
         
         # Month (1-12)
         df['list_month'] = df[date_column].dt.month.fillna(1)
+        list_month_angle = 2 * np.pi * ((df['list_month'] - 1) / 12.0)
+        df['list_month_sin'] = np.sin(list_month_angle)
+        df['list_month_cos'] = np.cos(list_month_angle)
+        list_dow_angle = 2 * np.pi * (df['list_day_of_week'] / 7.0)
+        df['list_day_of_week_sin'] = np.sin(list_dow_angle)
+        df['list_day_of_week_cos'] = np.cos(list_dow_angle)
         
         # Season (1=Winter, 2=Spring, 3=Summer, 4=Fall)
         df['season'] = ((df[date_column].dt.month - 1) // 3 + 1).fillna(1)
@@ -497,7 +511,9 @@ class FeatureEngineer:
             
             # Temporal features
             'age_years', 'sale_year', 'sale_month', 'sale_quarter',
+            'sale_month_sin', 'sale_month_cos', 'sale_quarter_sin', 'sale_quarter_cos',
             'is_spring_summer', 'days_since_sale',
+            'list_month_sin', 'list_month_cos', 'list_day_of_week_sin', 'list_day_of_week_cos',
             
             # Location features
             'is_sfr', 'is_townhome', 'is_condo', 'subdivision_size',

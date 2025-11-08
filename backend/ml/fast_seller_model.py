@@ -50,7 +50,11 @@ class FastSellerModel:
         y_dom: pd.Series,  # Continuous: DOM to pending
         test_size: float = 0.2,
         validation_size: float = 0.2,
-        hyperparameter_tuning: bool = True
+        hyperparameter_tuning: bool = True,
+        enable_dom_regression: bool = True,
+        dom_regression_min_samples: int = 10000,
+        dom_regression_max_mae: Optional[float] = None,
+        dom_regression_mask: Optional[pd.Series] = None
     ) -> Dict[str, Any]:
         """
         Train both fast seller classifier and DOM regressor.
@@ -74,6 +78,25 @@ class FastSellerModel:
         # Apply log transform to DOM target for stability
         y_dom = y_dom.clip(lower=0)
         y_dom_log = np.log1p(y_dom)
+        if not isinstance(y_dom_log, pd.Series):
+            y_dom_log = pd.Series(y_dom_log, index=y_dom.index)
+        
+        if isinstance(dom_regression_mask, pd.Series):
+            dom_reg_mask_series = dom_regression_mask.reindex(X.index).fillna(False).astype(bool)
+        elif dom_regression_mask is None:
+            dom_reg_mask_series = pd.Series(True, index=X.index)
+        else:
+            dom_reg_mask_series = pd.Series(dom_regression_mask, index=X.index).astype(bool)
+        
+        mask_array = dom_reg_mask_series.to_numpy()
+        X_reg = X.iloc[mask_array]
+        y_dom_reg = y_dom.iloc[mask_array]
+        y_dom_log_reg = y_dom_log.iloc[mask_array]
+        dom_sample_count = int((y_dom_reg > 0).sum())
+        self.model_metadata['dom_training_samples'] = dom_sample_count
+        self.model_metadata['dom_regression_min_samples'] = dom_regression_min_samples
+        self.model_metadata['dom_regression_enabled'] = enable_dom_regression
+        self.model_metadata['dom_regression_max_mae'] = dom_regression_max_mae
         
         # Train/validation/test split with stratification when possible
         try:
@@ -104,15 +127,95 @@ class FastSellerModel:
             hyperparameter_tuning
         )
         
-        logger.info("Skipping DOM regressor training; using heuristic DOM statistics")
-        self.dom_regressor = None
-        regressor_metrics = {
+        fallback_metrics = {
             'strategy': 'zip_median_heuristic',
             'test_mae': None,
             'test_mape': None,
             'test_r2': None,
             'test_rmse': None
         }
+        regressor_metrics = fallback_metrics.copy()
+
+        can_train_regressor = enable_dom_regression
+
+        if not enable_dom_regression:
+            logger.info("Skipping DOM regressor training; feature disabled.")
+            can_train_regressor = False
+            self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+        elif dom_sample_count < dom_regression_min_samples:
+            logger.info(
+                "Skipping DOM regressor training; usable metro samples=%s (required=%s).",
+                dom_sample_count,
+                dom_regression_min_samples,
+            )
+            can_train_regressor = False
+            self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+        elif len(X_reg) < 10:
+            logger.warning(
+                "Skipping DOM regressor training; insufficient metro observations after masking (%s rows).",
+                len(X_reg),
+            )
+            can_train_regressor = False
+            self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+
+        if can_train_regressor:
+            try:
+                X_train_reg, X_temp_reg, y_dom_log_train_reg, y_dom_log_temp_reg, y_dom_train_reg, y_dom_temp_reg = train_test_split(
+                    X_reg, y_dom_log_reg, y_dom_reg, test_size=test_size, random_state=42
+                )
+                split_ratio = validation_size / (test_size + validation_size)
+                X_val_reg, X_test_reg, y_dom_log_val_reg, y_dom_log_test_reg, y_dom_val_reg, y_dom_test_reg = train_test_split(
+                    X_temp_reg, y_dom_log_temp_reg, y_dom_temp_reg, test_size=split_ratio, random_state=42
+                )
+            except ValueError:
+                logger.warning(
+                    "Unable to create DOM regressor splits (samples=%s); falling back to heuristic.",
+                    len(X_reg),
+                )
+                can_train_regressor = False
+                self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+
+        if can_train_regressor:
+            try:
+                regressor_metrics = self._train_dom_regressor(
+                    X_train_reg, y_dom_log_train_reg, y_dom_train_reg,
+                    X_val_reg, y_dom_log_val_reg, y_dom_val_reg,
+                    X_test_reg, y_dom_log_test_reg, y_dom_test_reg,
+                    hyperparameter_tuning
+                )
+                regressor_metrics['strategy'] = 'xgboost_regressor'
+
+                if (
+                    dom_regression_max_mae is not None
+                    and regressor_metrics['test_mae'] is not None
+                    and regressor_metrics['test_mae'] > dom_regression_max_mae
+                ):
+                    logger.warning(
+                        "DOM regressor MAE %.2f exceeds threshold %.2f; reverting to heuristic.",
+                        regressor_metrics['test_mae'],
+                        dom_regression_max_mae,
+                    )
+                    self.dom_regressor = None
+                    regressor_metrics = fallback_metrics.copy()
+                    self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+                elif self.dom_regressor is not None:
+                    train_sample_count = int(len(X_train_reg) + len(X_val_reg))
+                    self.model_metadata['dom_regressor_samples'] = train_sample_count
+                    self.model_metadata['dom_log_range'] = {
+                        'min': float(y_dom_log_reg.min()),
+                        'max': float(y_dom_log_reg.max())
+                    }
+                    self.model_metadata['dom_strategy'] = 'regression_metro_only'
+            except Exception:
+                logger.exception("DOM regressor training failed; falling back to heuristic")
+                self.dom_regressor = None
+                regressor_metrics = fallback_metrics.copy()
+                self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
+
+        if self.dom_regressor is None:
+            regressor_metrics = fallback_metrics.copy()
+            if 'dom_strategy' not in self.model_metadata:
+                self.model_metadata['dom_strategy'] = 'zip_median_heuristic'
         
         # Store metadata (thresholds_by_zip should be set before calling train())
         if 'thresholds_by_zip' not in self.model_metadata:
@@ -343,7 +446,13 @@ class FastSellerModel:
             'test_rmse': rmse
         }
         
-        logger.info(f"Regressor Test MAPE: {mape:.2f}%")
+        logger.info(
+            "Regressor evaluation -> MAE: %.2f days | MAPE: %.2f%% | RMSE: %.2f | R2: %.3f",
+            mae,
+            mape,
+            rmse,
+            r2,
+        )
         return metrics
     
     def predict_fast_seller_probability(self, X: pd.DataFrame) -> np.ndarray:
@@ -374,10 +483,15 @@ class FastSellerModel:
             )
         preds = np.expm1(preds_log)
         preds = np.clip(preds, 0, None)
+        whitelist = {str(z) for z in self.model_metadata.get('dom_regression_zip_whitelist', []) if str(z)}
+        if zip_codes is None and whitelist:
+            return self._predict_dom_with_stats(zip_codes, len(X))
+
         if zip_codes is not None:
             stats = self.model_metadata.get('dom_stats_by_zip', {})
             global_cap = self.model_metadata.get('dom_global_p90', None)
             adjusted = []
+            fallback_indices = []
             for pred, zip_code in zip(preds, zip_codes):
                 key = str(zip_code) if zip_code is not None else None
                 stat = stats.get(key, {})
@@ -389,7 +503,15 @@ class FastSellerModel:
                 if value <= 0 and median is not None:
                     value = median
                 adjusted.append(value)
+                if whitelist and key not in whitelist:
+                    fallback_indices.append(len(adjusted) - 1)
             preds = np.array(adjusted, dtype=float)
+            if fallback_indices:
+                fallback_values = self._predict_dom_with_stats(
+                    [zip_codes[index] for index in fallback_indices],
+                    len(fallback_indices),
+                )
+                preds[fallback_indices] = fallback_values
         return preds
 
     def _predict_dom_with_stats(

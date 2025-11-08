@@ -321,6 +321,48 @@ def fetch_sold_listings_with_features(
         # Calculate DOM metrics
         listings = analyzer.calculate_dom_metrics(listings)
 
+        dom_cutoff = getattr(settings, "dom_regression_dom_cutoff", None)
+        dom_min = getattr(settings, "dom_regression_min_dom", 0) or 0
+        if dom_cutoff and dom_cutoff > 0:
+            filtered_listings: List[Dict[str, Any]] = []
+            dom_filtered = 0
+            dom_low_filtered = 0
+            dom_high_filtered = 0
+            for item in listings:
+                dom_value = item.get("dom_to_pending")
+                if dom_value is None:
+                    dom_filtered += 1
+                    continue
+                if dom_value < dom_min:
+                    dom_filtered += 1
+                    dom_low_filtered += 1
+                    continue
+                if dom_cutoff and dom_value > dom_cutoff:
+                    dom_filtered += 1
+                    dom_high_filtered += 1
+                    continue
+                filtered_listings.append(item)
+            logger.info(
+                "[%s/%s] 🧮 DOM filter -> kept=%s removed=%s (min=%s days, cutoff=%s days, under_min=%s, over_max=%s)",
+                index,
+                total_zips,
+                len(filtered_listings),
+                dom_filtered,
+                dom_min,
+                dom_cutoff,
+                dom_low_filtered,
+                dom_high_filtered,
+            )
+            listings = filtered_listings
+            if not listings:
+                logger.warning(
+                    "[%s/%s] ⚠️ DOM filter removed all listings for ZIP %s; retaining heuristic-only view",
+                    index,
+                    total_zips,
+                    zip_code,
+                )
+                return []
+
         # Extract features from descriptions (with batching)
         listings = extractor.batch_extract_features(listings, batch_size=15)
 
@@ -611,6 +653,26 @@ def train_fast_seller_model(
         len(valid_indices),
         int(y_fast_seller.sum()),
     )
+    metro_zips_setting = getattr(settings, "dom_regression_metro_zips", [])
+    metro_zips = {str(z).strip() for z in metro_zips_setting if str(z).strip()}
+    dom_regression_mask_values: List[bool] = []
+    for idx in valid_indices:
+        listing = listings[idx]
+        zip_code = listing.get('zip_code') or listing.get('zipCode')
+        if not zip_code and listing.get('address'):
+            import re
+            zip_match = re.search(r'\b(\d{5})\b', listing.get('address', ''))
+            zip_code = zip_match.group(1) if zip_match else None
+        dom_regression_mask_values.append(str(zip_code) in metro_zips if zip_code else False)
+    dom_regression_mask = pd.Series(dom_regression_mask_values, index=y_dom.index, dtype=bool)
+    metro_sample_count = int(dom_regression_mask.sum())
+    metro_ratio = float(metro_sample_count / len(dom_regression_mask)) if len(dom_regression_mask) else 0.0
+    logger.info(
+        "DOM regression metro coverage: %s samples (%.1f%% of %s)",
+        metro_sample_count,
+        metro_ratio * 100,
+        len(dom_regression_mask),
+    )
     from collections import defaultdict
     dom_values_by_zip = defaultdict(list)
     for idx in valid_indices:
@@ -642,6 +704,10 @@ def train_fast_seller_model(
     feature_start = time.perf_counter()
     logger.info("Engineering feature matrix for %s samples...", len(valid_indices))
     X = engineer_features(listings, valid_indices)
+    X = X.reset_index(drop=True)
+    y_fast_seller = y_fast_seller.reset_index(drop=True)
+    y_dom = y_dom.reset_index(drop=True)
+    dom_regression_mask = dom_regression_mask.reset_index(drop=True)
     feature_duration = time.perf_counter() - feature_start
     logger.info(
         "Feature engineering complete in %.1fs | shape=(%s, %s)",
@@ -667,18 +733,35 @@ def train_fast_seller_model(
     model.model_metadata['dom_global_p90'] = float(np.percentile(y_dom, 90))
     model.model_metadata['dom_strategy'] = 'zip_median_heuristic'
     model.model_metadata['dom_bucket_counts'] = bucket_distribution
+    model.model_metadata['dom_regression_scope'] = 'metro_only' if metro_zips else 'all_zips'
+    model.model_metadata['dom_regression_zip_whitelist'] = sorted(metro_zips)
+    model.model_metadata['dom_regression_mask_positive_count'] = metro_sample_count
+    model.model_metadata['dom_regression_mask_positive_ratio'] = metro_ratio
+    model.model_metadata['dom_regression_min_dom'] = getattr(settings, 'dom_regression_min_dom', None)
 
     logger.info(
         "Starting model training (hyperparameter_tuning=%s, save_models=%s)...",
         hyperparameter_tuning,
         save_models,
     )
+    dom_regression_enabled = getattr(settings, 'dom_regression_enabled', True)
+    dom_regression_min_samples = getattr(settings, 'dom_regression_min_samples', 10000)
+    dom_regression_max_mae = getattr(settings, 'dom_regression_max_mae', None)
+    dom_cutoff = getattr(settings, 'dom_regression_dom_cutoff', None)
+    model.model_metadata['dom_regression_enabled'] = dom_regression_enabled
+    model.model_metadata['dom_regression_cutoff'] = dom_cutoff
+    model.model_metadata['dom_regression_total_labeled'] = int(len(y_dom))
+    model.model_metadata['dom_regression_max_mae'] = dom_regression_max_mae
     training_start = time.perf_counter()
     metrics = model.train(
         X=X,
         y_fast_seller=y_fast_seller,
         y_dom=y_dom,
-        hyperparameter_tuning=hyperparameter_tuning
+        hyperparameter_tuning=hyperparameter_tuning,
+        enable_dom_regression=dom_regression_enabled,
+        dom_regression_min_samples=dom_regression_min_samples,
+        dom_regression_max_mae=dom_regression_max_mae,
+        dom_regression_mask=dom_regression_mask,
     )
     training_duration = time.perf_counter() - training_start
     logger.info("Model training finished in %.1fs", training_duration)

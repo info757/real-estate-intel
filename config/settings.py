@@ -42,6 +42,30 @@ class Settings(BaseSettings):
         default=6000, env="REALESTATEAPI_MAX_RESULTS_PER_ZIP"
     )
     listings_source: str = Field(default="rapidapi", env="LISTINGS_SOURCE")
+    dom_regression_dom_cutoff: int = Field(
+        default=120, env="DOM_REGRESSION_DOM_CUTOFF"
+    )
+    dom_regression_min_dom: int = Field(
+        default=3, env="DOM_REGRESSION_MIN_DOM"
+    )
+    dom_regression_enabled: bool = Field(
+        default=True, env="DOM_REGRESSION_ENABLED"
+    )
+    dom_regression_min_samples: int = Field(
+        default=8000, env="DOM_REGRESSION_MIN_SAMPLES"
+    )
+    dom_regression_max_mae: float = Field(
+        default=25.0, env="DOM_REGRESSION_MAX_MAE"
+    )
+    dom_regression_metro_zips: List[str] = Field(
+        default_factory=lambda: [
+            "27101", "27103", "27104", "27105", "27106", "27107", "27127",
+            "27214", "27215", "27217", "27260", "27262", "27263", "27265",
+            "27282", "27284", "27401", "27403", "27405", "27406", "27407",
+            "27408", "27409", "27410", "27455"
+        ],
+        env="DOM_REGRESSION_METRO_ZIPS"
+    )
     
     # Database (Production)
     database_url: str = Field(
