@@ -20,6 +20,95 @@ class FeatureEngineer:
     
     def __init__(self):
         pass
+
+    def _to_float(self, value: Any) -> Optional[float]:
+        """Convert value to float if possible."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "").replace("$", "")
+            if cleaned in {"", "NA", "N/A", "null"}:
+                return None
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
+        return None
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        """Convert value to integer if possible."""
+        float_value = self._to_float(value)
+        if float_value is None:
+            return None
+        try:
+            return int(float_value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_from_candidates(self, prop: Dict[str, Any], candidates: List[Any]) -> Any:
+        """Return the first non-null value from a list of candidate lookups."""
+        for candidate in candidates:
+            result = None
+            if callable(candidate):
+                try:
+                    result = candidate(prop)
+                except Exception:
+                    result = None
+            elif isinstance(candidate, (list, tuple)):
+                result = self._safe_get(prop, list(candidate))
+            else:
+                result = prop.get(candidate)
+            if result not in (None, "", [], {}):
+                return result
+        return None
+
+    def _extract_sale_price(self, prop: Dict[str, Any]) -> Optional[float]:
+        """Extract sale price from multiple possible RealEstateApi / ATTOM fields."""
+        summary = prop.get("summary") or {}
+        detail = prop.get("property_detail_raw") or {}
+        candidates = [
+            ["sale", "amount", "saleamt"],
+            "sale_price",
+            "price",
+            ["sale", "price"],
+            ["sale", "salePrice"],
+            ["sale", "listPrice"],
+            ["summary", "salePrice"],
+            ["summary", "price"],
+            ["summary", "soldPrice"],
+            ["summary", "lastSaleAmount"],
+            ["summary", "mlsSoldPrice"],
+            ["summary", "lastSalePrice"],
+            lambda _: (summary.get("lastSale") or {}).get("amount"),
+            lambda _: (summary.get("sale") or {}).get("amount"),
+            ["property_detail_raw", "mlsSoldPrice"],
+            ["property_detail_raw", "lastSalePrice"],
+            ["property_detail_raw", "lastSaleAmount"],
+            lambda _: (detail.get("lastSale") or {}).get("saleAmount"),
+        ]
+        value = self._extract_from_candidates(prop, candidates)
+        return self._to_float(value)
+
+    def _extract_date(self, prop: Dict[str, Any], candidates: List[Any]) -> Optional[str]:
+        """Extract date-like string from candidates."""
+        value = self._extract_from_candidates(prop, candidates)
+        if isinstance(value, (str, bytes)):
+            return value
+        return None
+
+    def _extract_numeric(self, prop: Dict[str, Any], candidates: List[Any]) -> Optional[float]:
+        """Extract numeric value (float) from candidates."""
+        value = self._extract_from_candidates(prop, candidates)
+        return self._to_float(value)
+
+    def _extract_text(self, prop: Dict[str, Any], candidates: List[Any]) -> Optional[str]:
+        """Extract text value from candidates."""
+        value = self._extract_from_candidates(prop, candidates)
+        if value is None:
+            return None
+        return str(value)
     
     def engineer_features(
         self,
@@ -45,31 +134,132 @@ class FeatureEngineer:
         for prop in properties:
             row = {}
             # Extract sale_price from nested structure
-            sale_price = self._safe_get(prop, ['sale', 'amount', 'saleamt'])
-            sale_date = self._safe_get(prop, ['sale', 'saleTransDate']) or prop.get('dateSold')
+            sale_price = self._extract_sale_price(prop)
+            sale_date = self._extract_date(prop, [
+                ['sale', 'saleTransDate'],
+                'sale_date',
+                'sold_date',
+                ['summary', 'soldDate'],
+                ['summary', 'lastSaleDate'],
+                ['summary', 'mlsLastSaleDate'],
+                ['summary', 'mlsLastStatusDate'],
+                ['property_detail_raw', 'lastSaleDate'],
+                ['property_detail_raw', 'mlsLastSaleDate'],
+            ])
             
             # Extract other nested fields
             row['sale_price'] = sale_price
             row['sale_date'] = sale_date
-            row['list_date'] = prop.get('listing_date') or prop.get('list_date')
-            row['pending_date'] = prop.get('pending_date')
-            row['dom_to_pending'] = prop.get('dom_to_pending')
-            row['dom_to_sold'] = prop.get('dom_to_sold')
-            row['pending_to_sold'] = prop.get('pending_to_sold')
+            row['list_date'] = self._extract_date(prop, [
+                'listing_date',
+                'list_date',
+                ['summary', 'listDate'],
+                ['summary', 'mlsListingDate'],
+                ['property_detail_raw', 'mlsListingDate'],
+                ['property_detail_raw', 'listDate'],
+            ])
+            row['pending_date'] = self._extract_date(prop, [
+                'pending_date',
+                ['summary', 'pendingDate'],
+                ['property_detail_raw', 'pendingDate'],
+                ['property_detail_raw', 'mlsPendingDate'],
+            ])
+            row['dom_to_pending'] = self._extract_numeric(prop, [
+                'dom_to_pending',
+                ['summary', 'mlsDaysOnMarket'],
+                ['property_detail_raw', 'mlsDaysOnMarket'],
+                lambda p: (p.get('timeline') or {}).get('dom_to_pending'),
+            ])
+            row['dom_to_sold'] = self._extract_numeric(prop, [
+                'dom_to_sold',
+                lambda p: (p.get('timeline') or {}).get('dom_to_sold'),
+            ])
+            row['pending_to_sold'] = self._extract_numeric(prop, [
+                'pending_to_sold',
+                lambda p: (p.get('timeline') or {}).get('pending_to_sold'),
+            ])
             
             # Flatten common fields
-            row['beds'] = self._safe_get(prop, ['building', 'rooms', 'beds']) or self._safe_get(prop, ['summary', 'beds'])
-            row['baths'] = self._safe_get(prop, ['building', 'rooms', 'bathstotal']) or self._safe_get(prop, ['summary', 'bathstotal'])
-            row['sqft'] = self._safe_get(prop, ['building', 'size', 'universalsize']) or self._safe_get(prop, ['summary', 'universalsize'])
-            row['lot_size_acres'] = self._safe_get(prop, ['lot', 'lotsize1'])
-            row['lot_size_sqft'] = self._safe_get(prop, ['lot', 'lotsize2'])
-            row['year_built'] = self._safe_get(prop, ['summary', 'yearbuilt'])
-            row['stories'] = self._safe_get(prop, ['building', 'summary', 'levels'])
-            row['zip_code'] = self._safe_get(prop, ['address', 'postal1'])
-            row['subdivision'] = self._safe_get(prop, ['area', 'subdname'])
-            row['latitude'] = self._safe_get(prop, ['location', 'latitude'])
-            row['longitude'] = self._safe_get(prop, ['location', 'longitude'])
-            row['property_type'] = self._safe_get(prop, ['summary', 'proptype'])
+            row['beds'] = self._extract_numeric(prop, [
+                'beds',
+                ['summary', 'beds'],
+                ['summary', 'bedrooms'],
+                ['property_detail_raw', 'summary', 'beds'],
+                ['property_detail_raw', 'propertyInfo', 'bedRooms'],
+            ])
+            row['baths'] = self._extract_numeric(prop, [
+                'baths',
+                ['summary', 'bathstotal'],
+                ['summary', 'bathrooms'],
+                ['property_detail_raw', 'summary', 'baths'],
+                ['property_detail_raw', 'propertyInfo', 'bathRoomsFull'],
+            ])
+            row['sqft'] = self._extract_numeric(prop, [
+                'sqft',
+                ['summary', 'universalsize'],
+                ['summary', 'squareFeet'],
+                ['summary', 'universalsize'],
+                ['property_detail_raw', 'summary', 'universalsize'],
+                ['property_detail_raw', 'propertyInfo', 'squareFeet'],
+            ])
+            row['lot_size_acres'] = self._extract_numeric(prop, [
+                'lot_size_acres',
+                ['summary', 'lotSizeAcres'],
+                ['property_detail_raw', 'lotInfo', 'lotSizeAcres'],
+            ])
+            row['lot_size_sqft'] = self._extract_numeric(prop, [
+                'lot_size_sqft',
+                ['summary', 'lotSquareFeet'],
+                ['property_detail_raw', 'lotInfo', 'lotSquareFeet'],
+            ])
+            row['year_built'] = self._extract_numeric(prop, [
+                'year_built',
+                ['summary', 'yearbuilt'],
+                ['summary', 'yearBuilt'],
+                ['property_detail_raw', 'summary', 'yearBuilt'],
+                ['property_detail_raw', 'propertyInfo', 'yearBuilt'],
+            ])
+            row['stories'] = self._extract_numeric(prop, [
+                'stories',
+                ['summary', 'stories'],
+                ['property_detail_raw', 'summary', 'stories'],
+                ['property_detail_raw', 'propertyInfo', 'stories'],
+            ])
+            row['zip_code'] = self._extract_text(prop, [
+                'zip_code',
+                'zipCode',
+                ['address', 'zip'],
+                ['address', 'postal1'],
+                ['summary', 'postalCode'],
+                ['summary', 'address', 'postalCode'],
+            ])
+            row['subdivision'] = self._extract_text(prop, [
+                'subdivision',
+                ['summary', 'subdivision'],
+                lambda p: ((p.get('summary') or {}).get('neighborhood') or {}).get('name'),
+                lambda p: ((p.get('property_detail_raw') or {}).get('neighborhood') or {}).get('name'),
+            ])
+            row['latitude'] = self._extract_numeric(prop, [
+                'latitude',
+                ['summary', 'latitude'],
+                ['location', 'latitude'],
+                ['geocode', 'lat'],
+                lambda p: (p.get('address') or {}).get('latitude'),
+            ])
+            row['longitude'] = self._extract_numeric(prop, [
+                'longitude',
+                ['summary', 'longitude'],
+                ['location', 'longitude'],
+                ['geocode', 'lon'],
+                ['geocode', 'lng'],
+                lambda p: (p.get('address') or {}).get('longitude'),
+            ])
+            row['property_type'] = self._extract_text(prop, [
+                'property_type',
+                ['summary', 'propertyType'],
+                ['property_detail_raw', 'propertyType'],
+                ['summary', 'proptype'],
+            ])
             
             # Store original property for any other extractions
             row['_original_property'] = prop

@@ -4,7 +4,8 @@ Identify ZIP codes similar to 27410 and discover full Greensboro coverage.
 
 import sys
 import os
-from typing import List
+from pathlib import Path
+from typing import List, Iterable, Set
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -19,6 +20,70 @@ ALL_GREENSBORO_ZIPS = [
     '27408', '27409', '27410', '27411', '27412', '27429', '27435',
     '27438', '27455', '27495', '27497', '27498', '27499'
 ]
+
+# Core Piedmont Triad counties (Greensboro / Winston-Salem / High Point region)
+TRIAD_COUNTIES = [
+    "Alamance County",
+    "Caswell County",
+    "Davidson County",
+    "Davie County",
+    "Forsyth County",
+    "Guilford County",
+    "Montgomery County",
+    "Randolph County",
+    "Rockingham County",
+    "Stokes County",
+    "Surry County",
+    "Yadkin County",
+]
+
+
+def _zips_from_cache(pattern: str = "listings_*_730days*.json") -> List[str]:
+    """Load ZIPs from cached RealEstateApi listing files if available."""
+    cache_root = Path("cache/listings/realestateapi")
+    if not cache_root.exists():
+        return []
+    zips = {
+        path.name.split("_")[1]
+        for path in cache_root.glob(pattern)
+        if path.name.startswith("listings_")
+    }
+    return sorted(zips)
+
+
+def _collect_zips_from_records(records: Iterable[dict]) -> Set[str]:
+    """Collect ZIP codes from API records."""
+    discovered: Set[str] = set()
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        candidates = []
+        address_block = rec.get("address") or {}
+        candidates.extend([
+            address_block.get("zip"),
+            address_block.get("postalCode"),
+            address_block.get("postal_code"),
+        ])
+        summary = rec.get("summary") or {}
+        candidates.extend([
+            summary.get("postalCode"),
+            summary.get("zip"),
+        ])
+        property_info = rec.get("propertyInfo") or rec.get("property_info") or {}
+        pi_address = property_info.get("address") or {}
+        candidates.extend([
+            pi_address.get("zip"),
+            pi_address.get("postalCode"),
+        ])
+        candidates.extend([
+            rec.get("zip"),
+            rec.get("zipCode"),
+            rec.get("postal_code"),
+        ])
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.isdigit() and len(candidate) == 5:
+                discovered.add(candidate)
+    return discovered
 
 
 def get_training_zips(use_similar_only: bool = True) -> List[str]:
@@ -88,6 +153,60 @@ def discover_greensboro_zips(max_pages: int = 10) -> List[str]:
             break
 
     return sorted(discovered)
+
+
+def get_zips_for_counties(counties: List[str], state: str = "NC", max_pages: int = 5) -> List[str]:
+    """
+    Discover ZIP codes for the requested counties. Uses cache first, then falls back to API.
+    """
+    cached = _zips_from_cache()
+    if cached:
+        return cached
+
+    client = RealEstateAPIClient()
+    discovered: Set[str] = set()
+
+    for county in counties:
+        for page in range(1, max_pages + 1):
+            try:
+                response = client.search_mls_listings(
+                    status="sold",
+                    geography={"county": county, "state": state},
+                    include_count=True,
+                    page_size=250,
+                    page=page,
+                )
+            except Exception:
+                break
+
+            records = response.get("results") or response.get("listings") or response.get("data") or []
+            discovered.update(_collect_zips_from_records(records))
+
+            meta = response.get("pagination") or response.get("meta") or {}
+            total_pages = meta.get("total_pages") or meta.get("totalPages")
+            if total_pages and page >= int(total_pages):
+                break
+
+    combined = discovered or set(ALL_GREENSBORO_ZIPS)
+    return sorted(combined)
+
+
+def get_triad_zips(use_cache_first: bool = True) -> List[str]:
+    """
+    Return ZIP codes that cover the Piedmont Triad counties.
+    """
+    if use_cache_first:
+        cached = _zips_from_cache()
+        if cached:
+            return cached
+    county_zips = get_zips_for_counties(TRIAD_COUNTIES, state="NC")
+    if county_zips:
+        return county_zips
+    return sorted(set(SIMILAR_ZIPS) | set(ALL_GREENSBORO_ZIPS))
+
+
+# Backwards compatibility export
+TRIAD_ZIPS = get_triad_zips()
 
 
 if __name__ == '__main__':

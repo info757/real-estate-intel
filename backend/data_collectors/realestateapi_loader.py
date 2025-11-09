@@ -436,7 +436,7 @@ class RealEstateApiListingLoader:
             detail_payload.get("propertyInfo")
             if isinstance(detail_payload, dict)
             else {}
-        )
+        ) or {}
         prop_type = PropertyUseMapper.normalize(property_info)
         enriched.setdefault("metadata", {})
         enriched["metadata"].update(
