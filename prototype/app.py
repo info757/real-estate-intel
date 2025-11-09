@@ -30,8 +30,121 @@ from backend.analyzers.popularity_analyzer import popularity_analyzer
 from backend.ml.guardrails import guardrails
 from backend.ml.backtesting import backtester
 from backend.ai_engine.narrative_generator import generate_recommendation_narrative
+from backend.ml.pricing_model import PricingModel
+from backend.ml.demand_model import DemandModel
+from backend.ml.feature_engineering import FeatureEngineer
+from backend.ml.train_fast_seller_model import fetch_sold_listings_with_features
 from config.settings import settings
 from pathlib import Path
+
+GLOBAL_CSS = """
+<style>
+:root {
+    --bg: #0f172a;
+    --card-bg: rgba(15, 23, 42, 0.72);
+    --accent: #38bdf8;
+    --accent-soft: rgba(56, 189, 248, 0.12);
+    --text-primary: #f1f5f9;
+    --text-secondary: #cbd5f5;
+    --radius: 18px;
+}
+
+.block-container {
+    padding-top: 2.4rem;
+    padding-bottom: 2.6rem;
+}
+
+.metric-row {
+    display: flex;
+    gap: 1rem;
+    margin: 1.1rem 0;
+    flex-wrap: wrap;
+}
+
+.metric-card {
+    flex: 1 1 240px;
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 1.35rem;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    box-shadow: 0 20px 45px rgba(15, 23, 42, 0.35);
+    backdrop-filter: blur(12px);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.metric-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 25px 55px rgba(15, 23, 42, 0.45);
+}
+
+.metric-title {
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.4rem;
+}
+
+.metric-value {
+    font-size: 1.95rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.metric-footnote {
+    margin-top: 0.6rem;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+}
+
+.card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1.25rem;
+    margin-top: 1.25rem;
+}
+
+.alt-card {
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 1rem;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.alt-card-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.35rem;
+}
+
+.alt-card-metric {
+    display: flex;
+    justify-content: space-between;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    padding: 0.2rem 0;
+}
+
+.inline-highlight {
+    color: var(--accent);
+    font-weight: 600;
+}
+</style>
+"""
+
+
+def render_metric_card(title: str, value: str, footnote: Optional[str] = None) -> None:
+    foot_html = f'<div class="metric-footnote">{footnote}</div>' if footnote else ""
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-title">{title}</div>
+            <div class="metric-value">{value}</div>
+            {foot_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data
@@ -86,14 +199,143 @@ def get_market_features(
     return candidate_df.loc[nearest_idx].to_dict()
 
 
+@st.cache_resource(show_spinner=False)
+def load_tri_models() -> tuple[PricingModel, DemandModel]:
+    pricing = PricingModel(model_dir="models/triad_latest")
+    pricing.load(model_name="triad_pricing_model")
+    demand = DemandModel(model_dir="models/triad_latest")
+    demand.load(model_name="triad_demand_model")
+    return pricing, demand
+
+
+@st.cache_resource(show_spinner=False)
+def get_feature_engineer() -> FeatureEngineer:
+    return FeatureEngineer()
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_listings_for_zip(zip_code: str):
+    return fetch_sold_listings_with_features(
+        zip_codes=[str(zip_code)],
+        days_back=730,
+        max_per_zip=None,
+        use_cache=True,
+    )
+
+
+def _extract_listing_coords(listing: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    lat = listing.get("latitude") or (listing.get("summary") or {}).get("latitude")
+    lon = listing.get("longitude") or (listing.get("summary") or {}).get("longitude")
+    if lat is None:
+        lat = (listing.get("geocode") or {}).get("lat")
+    if lon is None:
+        geocode = listing.get("geocode") or {}
+        lon = geocode.get("lon") or geocode.get("lng")
+    return safe_float(lat), safe_float(lon)
+
+
+def compute_tri_model_predictions(zip_code: str, primary_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not zip_code:
+        return None
+
+    try:
+        listings = load_listings_for_zip(str(zip_code))
+    except Exception as exc:
+        st.warning(f"Triad model lookup failed for ZIP {zip_code}: {exc}")
+        return None
+
+    if not listings:
+        return None
+
+    target = None
+    str_pid = None
+    if primary_row is not None:
+        pid_value = (
+            primary_row.get("property_id")
+            or primary_row.get("propertyId")
+            or primary_row.get("id")
+        )
+        if pid_value is not None:
+            str_pid = str(pid_value)
+
+    if str_pid:
+        for listing in listings:
+            candidate_id = (
+                listing.get("property_id")
+                or (listing.get("summary") or {}).get("propertyId")
+                or (listing.get("summary") or {}).get("id")
+            )
+            if candidate_id is not None and str(candidate_id) == str_pid:
+                target = listing
+                break
+
+    if target is None and primary_row is not None:
+        primary_lat = safe_float(primary_row.get("latitude"))
+        primary_lon = safe_float(primary_row.get("longitude"))
+        if primary_lat is not None and primary_lon is not None:
+            best_listing = None
+            best_distance = None
+            for listing in listings:
+                lat, lon = _extract_listing_coords(listing)
+                if lat is None or lon is None:
+                    continue
+                distance = float(np.hypot(lat - primary_lat, lon - primary_lon))
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_listing = listing
+            if best_listing is not None:
+                target = best_listing
+
+    if target is None:
+        target = listings[0]
+
+    pricing_model, demand_model = load_tri_models()
+    engineer = get_feature_engineer()
+
+    try:
+        features_df = engineer.engineer_features([target])
+    except Exception as exc:
+        st.warning(f"Feature engineering failed for ZIP {zip_code}: {exc}")
+        return None
+
+    pricing_features = features_df.reindex(columns=pricing_model.feature_names, fill_value=0.0)
+    pricing_features = pricing_features.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    demand_features = features_df.reindex(columns=demand_model.feature_names, fill_value=0.0)
+    demand_features = demand_features.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    # ensure DOM-related columns stay meaningful
+    for dom_col in ["dom_to_pending", "dom_to_sold"]:
+        if dom_col in features_df.columns:
+            demand_features[dom_col] = features_df[dom_col]
+
+    try:
+        price_pred, price_lower, price_upper = pricing_model.predict(
+            pricing_features,
+            return_intervals=True,
+        )
+        demand_preds = demand_model.predict(demand_features)
+    except Exception as exc:
+        st.warning(f"Triad model prediction failed: {exc}")
+        return None
+
+    return {
+        "predicted_price": float(price_pred[0]),
+        "price_lower": float(price_lower[0]),
+        "price_upper": float(price_upper[0]),
+        "sell_probability": float(np.clip(demand_preds["sell_probability"][0], 0.0, 1.0)),
+        "expected_dom": float(max(demand_preds["expected_dom"][0], 0.0)),
+        "feature_snapshot": features_df.to_dict(orient="records")[0],
+    }
+
+
 DEMO_LOCATIONS = [
     {
-        "label": "Green Valley • Greensboro 27408 (High-end SFR)",
+        "label": "New Irving Park • Greensboro 27408 (High-end SFR)",
         "zip_code": "27408",
         "latitude": 36.1010667665,
         "longitude": -79.8401642095,
-        "subdivision": "Green Valley",
-        "notes": "4BR/3BA executive homes near Green Valley. Fast-sale prob ≈94%, DOM ≈40 days.",
+        "subdivision": "New Irving Park",
+        "notes": "4BR/3BA executive homes in New Irving Park. Fast-sale prob ≈94%, DOM ≈40 days.",
     },
     {
         "label": "Wyngate Village • Winston-Salem 27103 (Move-up townhome)",
@@ -179,11 +421,25 @@ def format_currency(value):
     return f"${value:,.0f}"
 
 
+def safe_float(value) -> Optional[float]:
+    """Convert to float when possible, returning None for invalid numbers."""
+    if value is None:
+        return None
+    try:
+        result = float(value)
+        if np.isnan(result):
+            return None
+        return result
+    except (TypeError, ValueError):
+        return None
+
+
 def main():
     """Main application."""
     
-    st.markdown('<div class="main-header">🏘️ Real Estate Intelligence Platform</div>', unsafe_allow_html=True)
-    st.markdown("*AI-Powered Market Analysis & Development Optimization for North Carolina*")
+    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="main-header">🏗️ BuildOptima</div>', unsafe_allow_html=True)
+    st.markdown("*What to build, where to build it, and how fast it will move*")
     
     # Sidebar
     with st.sidebar:
@@ -1134,12 +1390,14 @@ def show_ai_assistant():
 
 def show_ml_recommendations():
     """Show ML-based build recommendations using seasonality report."""
-    st.header("🧠 Builder Recommendation (Preview)")
-    st.caption("Preview pulls directly from reports/seasonality_adjusted_predictions.csv (Triad data).")
+    st.header("🧠 BuildOptima Recommendation Studio")
+    st.caption("Blend current Triad model outputs with historical seasonality context to guide your next spec.")
 
-    # Hero presets
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Builder Inputs")
+
     demo_labels = ["Custom entry"] + [loc["label"] for loc in DEMO_LOCATIONS]
-    selected_demo = st.selectbox("Hero Locations", demo_labels, index=0, key="preview_demo")
+    selected_demo = st.sidebar.selectbox("Hero Locations", demo_labels, index=0, key="preview_demo")
 
     defaults = {
         "zip": "27410",
@@ -1161,33 +1419,41 @@ def show_ml_recommendations():
                 }
             )
 
-    st.caption(defaults["notes"] or "Enter lot information below.")
+    previous_demo = st.session_state.get("_last_selected_demo")
+    if selected_demo != "Custom entry" and previous_demo != selected_demo:
+        st.session_state["preview_zip"] = defaults["zip"]
+        st.session_state["preview_lat"] = defaults["lat"]
+        st.session_state["preview_lon"] = defaults["lon"]
+        st.session_state["preview_subdivision"] = defaults["subdivision"]
+    st.session_state["_last_selected_demo"] = selected_demo
 
-    col1, col2 = st.columns(2)
-    with col1:
-        zip_code = st.text_input("ZIP Code", value=defaults["zip"], key="preview_zip")
-        latitude = st.number_input("Latitude", value=defaults["lat"], format="%.6f", key="preview_lat")
-        longitude = st.number_input("Longitude", value=defaults["lon"], format="%.6f", key="preview_lon")
-    with col2:
-        subdivision = st.text_input("Subdivision (optional)", value=defaults["subdivision"], key="preview_subdivision")
+    with st.sidebar.form("builder_form"):
+        zip_code = st.text_input("ZIP Code", value=st.session_state.get("preview_zip", defaults["zip"]), key="preview_zip")
+        latitude = st.number_input("Latitude", value=st.session_state.get("preview_lat", defaults["lat"]), format="%.6f", key="preview_lat")
+        longitude = st.number_input("Longitude", value=st.session_state.get("preview_lon", defaults["lon"]), format="%.6f", key="preview_lon")
+        subdivision = st.text_input("Subdivision (optional)", value=st.session_state.get("preview_subdivision", defaults["subdivision"]), key="preview_subdivision")
         property_type = st.selectbox(
             "Property Type",
             ["Any", "Single Family", "Townhome", "Condo"],
             index=0,
             key="preview_property_type",
         )
+        generate_clicked = st.form_submit_button("Generate builder recommendation", type="primary")
 
-    def match_rows() -> pd.DataFrame:
+    if defaults.get("notes"):
+        st.sidebar.caption(defaults["notes"])
+
+    def match_rows(zip_code_val: str, lat_val: float, lon_val: float, prop_type_val: str, subdivision_val: str) -> pd.DataFrame:
         df = load_seasonality_report()
         if df.empty:
             return df
 
-        candidates = df[df["zip_code"].astype(str) == str(zip_code)].copy()
-        if property_type != "Any" and "property_type" in candidates.columns:
-            key = property_type.split()[0][:3].upper()
+        candidates = df[df["zip_code"].astype(str) == str(zip_code_val)].copy()
+        if prop_type_val != "Any" and "property_type" in candidates.columns:
+            key = prop_type_val.split()[0][:3].upper()
             candidates = candidates[candidates["property_type"].fillna("").str.upper().str.contains(key)]
-        if subdivision:
-            subset = candidates[candidates["subdivision"].fillna("").str.lower() == subdivision.lower()]
+        if subdivision_val:
+            subset = candidates[candidates["subdivision"].fillna("").str.lower() == subdivision_val.lower()]
             if not subset.empty:
                 candidates = subset
 
@@ -1195,23 +1461,25 @@ def show_ml_recommendations():
             return candidates
 
         candidates["distance"] = np.sqrt(
-            (candidates["latitude"] - latitude) ** 2 + (candidates["longitude"] - longitude) ** 2
+            (candidates["latitude"] - lat_val) ** 2 + (candidates["longitude"] - lon_val) ** 2
         )
         candidates["fast_seller_probability"] = candidates.get("fast_seller_probability", 0.0).fillna(0.0)
         candidates.sort_values(["distance", "fast_seller_probability"], ascending=[True, False], inplace=True)
         return candidates.head(3)
 
-    if st.button("Generate builder recommendation", type="primary", key="preview_generate"):
-        matches = match_rows()
+    if generate_clicked:
+        matches = match_rows(zip_code, latitude, longitude, property_type, subdivision)
         if matches.empty:
             st.warning("No comparable listings found in the seasonality report. Try another ZIP or adjust coordinates.")
             st.session_state.pop("preview_matches", None)
-            return
-        st.session_state.preview_matches = matches.to_dict(orient="records")
-        st.success(f"Loaded {len(matches)} nearby sold listings from the report.")
+        else:
+            st.session_state.preview_matches = matches.to_dict(orient="records")
+            st.session_state.triad_model_cache = {}
+            st.toast(f"Loaded {len(matches)} nearby baseline comps.")
 
     matches_state = st.session_state.get("preview_matches", [])
     if not matches_state:
+        st.info("Use the controls in the sidebar to load a recommendation.")
         return
 
     primary = matches_state[0]
@@ -1221,17 +1489,76 @@ def show_ml_recommendations():
         f"{int(primary.get('beds', 0))} BR / {primary.get('baths', 0)} BA · "
         f"{int(primary.get('sqft', 0) or 0):,} sqft"
     )
-    prob = float(primary.get("fast_seller_probability", 0.0))
-    dom = float(primary.get("dom_zip_median", primary.get("days_from_list_to_pending", 0)))
-    sale_price = primary.get("sale_price") or primary.get("price") or "Not provided"
-    inv_ratio = float(primary.get("zip_inventory_trend_ratio", 1.0))
 
-    st.subheader("Recommended Spec (top sold analogue)")
-    st.markdown(f"### {spec_title}")
-    info_cols = st.columns(3)
-    info_cols[0].metric("Fast-sale probability", f"{prob*100:.0f}%")
-    info_cols[1].metric("ZIP median DOM", f"{dom:.0f} days")
-    info_cols[2].metric("Inventory trend ratio", f"{inv_ratio:.2f}")
+    zip_code_clean = str(zip_code).strip()
+    triad_cache = st.session_state.setdefault("triad_model_cache", {})
+    cache_key = "|".join(
+        [
+            zip_code_clean,
+            str(primary.get("property_id") or primary.get("propertyId") or primary.get("id") or ""),
+            str(primary.get("latitude") or ""),
+            str(primary.get("longitude") or ""),
+        ]
+    )
+    if cache_key not in triad_cache:
+        with st.spinner("Scoring with Triad models..."):
+            triad_cache[cache_key] = compute_tri_model_predictions(zip_code_clean, primary)
+    model_preds = triad_cache.get(cache_key)
+
+    observed_prob = float(primary.get("fast_seller_probability", 0.0) or 0.0)
+    observed_dom = float(primary.get("dom_zip_median", primary.get("days_from_list_to_pending", 0)) or 0.0)
+    observed_price = primary.get("sale_price") or primary.get("price")
+    if isinstance(observed_price, str):
+        cleaned = observed_price.strip().replace(",", "").replace("$", "")
+        try:
+            observed_price = float(cleaned)
+        except ValueError:
+            observed_price = None
+
+    inv_ratio = safe_float(primary.get("zip_inventory_trend_ratio"))
+    triad_prob = observed_prob
+    triad_dom = observed_dom
+    predicted_price = observed_price
+    price_interval = None
+    fast_source = "seasonality"
+    dom_source = "seasonality"
+    price_source = "seasonality"
+    if model_preds:
+        sp = model_preds.get("sell_probability")
+        dom_pred = model_preds.get("expected_dom")
+        price_pred = model_preds.get("predicted_price")
+        if sp is not None:
+            triad_prob = sp
+            fast_source = "triad_model"
+        if dom_pred is not None:
+            triad_dom = dom_pred
+            dom_source = "triad_model"
+        if price_pred is not None:
+            predicted_price = price_pred
+            price_source = "triad_model"
+        lower = model_preds.get("price_lower")
+        upper = model_preds.get("price_upper")
+        if lower is not None and upper is not None:
+            price_interval = (lower, upper)
+
+    st.markdown(f'<span class="subheader-pill">🎯 {selected_demo}</span>', unsafe_allow_html=True)
+
+    summary_tab, baseline_tab, alternatives_tab, raw_tab = st.tabs(["Summary", "Seasonality Baseline", "Alternatives", "Raw Data"])
+
+    predicted_price_clean = None
+    observed_price_clean = None
+    if predicted_price is not None:
+        pred_val = safe_float(predicted_price)
+        if pred_val is not None:
+            predicted_price_clean = round(pred_val)
+    if observed_price is not None:
+        obs_val = safe_float(observed_price)
+        if obs_val is not None:
+            observed_price_clean = round(obs_val)
+    price_interval_clean = (
+        (round(price_interval[0]), round(price_interval[1])) if price_interval else None
+    )
+    inv_ratio_clean = round(inv_ratio, 2) if inv_ratio is not None else None
 
     narrative_metrics = {
         "lot": {
@@ -1249,10 +1576,12 @@ def show_ml_recommendations():
             "garage_spaces": primary.get("garage_spaces", 2),
         },
         "demand": {
-            "sell_probability": prob,
-            "expected_dom": dom,
-            "fast_seller_probability": prob,
-            "fast_seller_dom": dom,
+            "sell_probability": triad_prob,
+            "sell_probability_source": fast_source,
+            "expected_dom": triad_dom,
+            "expected_dom_source": dom_source,
+            "seasonality_fast_probability": observed_prob,
+            "seasonality_dom": observed_dom,
         },
         "margin": {
             "gross_margin": 0,
@@ -1260,43 +1589,154 @@ def show_ml_recommendations():
             "roi": 0,
         },
         "pricing": {
-            "predicted_sale_price": sale_price,
+            "predicted_sale_price": predicted_price_clean,
+            "predicted_sale_price_formatted": format_currency(predicted_price) if predicted_price is not None else None,
             "price_to_zip_median": primary.get("price_to_zip_median"),
             "price_to_subdivision_median": primary.get("price_to_subdivision_median"),
+            "observed_sale_price": observed_price_clean,
+            "observed_sale_price_formatted": format_currency(observed_price) if observed_price is not None else None,
         },
         "inventory": {
             "zip_sales_count_30d": primary.get("zip_sales_count_30d"),
             "zip_sales_count_90d": primary.get("zip_sales_count_90d"),
-            "zip_inventory_trend_ratio": inv_ratio,
+            "zip_inventory_trend_ratio": inv_ratio_clean,
         },
     }
+    if price_interval_clean:
+        narrative_metrics["pricing"]["predicted_price_low"] = price_interval_clean[0]
+        narrative_metrics["pricing"]["predicted_price_high"] = price_interval_clean[1]
+        narrative_metrics["pricing"]["predicted_price_low_formatted"] = format_currency(price_interval_clean[0])
+        narrative_metrics["pricing"]["predicted_price_high_formatted"] = format_currency(price_interval_clean[1])
+        narrative_metrics["pricing"]["predicted_price_range"] = (
+            f"{format_currency(price_interval_clean[0])} to {format_currency(price_interval_clean[1])}"
+        )
 
-    st.info(generate_recommendation_narrative(narrative_metrics))
+    with summary_tab:
+        summary_tab.markdown(f"#### {spec_title}")
+        summary_tab.markdown('<div class="metric-row">', unsafe_allow_html=True)
+        render_metric_card(
+            "Triad sell probability",
+            f"{triad_prob*100:.0f}%",
+            footnote=f"Seasonality baseline {observed_prob*100:.0f}%"
+        )
+        render_metric_card(
+            "Triad expected DOM",
+            f"{triad_dom:.0f} days",
+            footnote=f"Seasonality baseline {observed_dom:.0f} days"
+        )
+        observed = safe_float(primary.get("sale_price") or primary.get("price"))
+        price_display = format_currency(predicted_price) if predicted_price else (
+            format_currency(observed) if observed else "—"
+        )
+        if predicted_price and predicted_price < 1000 and observed:
+            price_display = format_currency(observed)
+        price_footnote = "Triad model" if price_source == "triad_model" else "Seasonality baseline"
+        render_metric_card(
+            "Predicted sale price",
+            price_display,
+            footnote=price_footnote
+        )
+        summary_tab.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("**Contextual metrics**")
-    st.write(
-        f"- ZIP price percentile rank: {primary.get('zip_price_percentile_rank', 0):.0f}\n"
-        f"- Relist flag: {'Yes' if primary.get('history_relisted', 0) else 'No'}\n"
-        f"- Historic pending count: {primary.get('history_pending_count', 0)}\n"
-        f"- Sale price (reported): {sale_price if isinstance(sale_price, str) else format_currency(sale_price)}"
-    )
+        prob_df = pd.DataFrame({
+            "Scenario": ["Triad model", "Seasonality baseline"],
+            "Probability": [triad_prob * 100, observed_prob * 100],
+        })
+        prob_fig = px.bar(
+            prob_df,
+            x="Scenario",
+            y="Probability",
+            color="Scenario",
+            text="Probability",
+            height=260,
+            title="Sell Probability Comparison (%)"
+        )
+        prob_fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=50, b=10))
+        prob_fig.update_traces(texttemplate="%{y:.0f}%", textposition="outside")
+        summary_tab.plotly_chart(prob_fig, use_container_width=True)
 
-    if alts:
-        st.markdown("---")
-        st.markdown("**Alternative matches**")
-        alt_cols = st.columns(len(alts))
-        for idx, row in enumerate(alts):
-            with alt_cols[idx]:
-                st.write(
-                    f"{int(row.get('beds', 0))} BR / {row.get('baths', 0)} BA · "
-                    f"{int(row.get('sqft', 0) or 0):,} sqft"
+        dom_df = pd.DataFrame({
+            "Scenario": ["Triad model", "Seasonality baseline"],
+            "DOM": [triad_dom, observed_dom],
+        })
+        dom_fig = px.bar(
+            dom_df,
+            x="Scenario",
+            y="DOM",
+            color="Scenario",
+            text="DOM",
+            height=260,
+            title="Days on Market Comparison"
+        )
+        dom_fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=50, b=10))
+        dom_fig.update_traces(texttemplate="%{y:.0f}", textposition="outside")
+        summary_tab.plotly_chart(dom_fig, use_container_width=True)
+
+        if inv_ratio is not None:
+            inv_fig = go.Figure(
+                go.Indicator(
+                    mode="gauge+number",
+                    value=inv_ratio,
+                    number={"valueformat": ".2f"},
+                    gauge={
+                        "axis": {"range": [0, max(1.5, inv_ratio * 1.2)], "tickwidth": 1},
+                        "bar": {"color": "#38bdf8"},
+                        "steps": [
+                            {"range": [0, 0.9], "color": "#1e293b"},
+                            {"range": [0.9, 1.1], "color": "#0f172a"},
+                            {"range": [1.1, max(1.5, inv_ratio * 1.2)], "color": "#172554"},
+                        ],
+                    },
+                    title={"text": "Inventory Trend Ratio (30d / 90d)"}
                 )
-                st.metric("Fast-sale probability", f"{row.get('fast_seller_probability', 0)*100:.0f}%")
-                st.caption(f"DOM ≈ {row.get('dom_zip_median', row.get('days_from_list_to_pending', '?'))}")
+            )
+            inv_fig.update_layout(height=260, margin=dict(l=35, r=35, t=60, b=0))
+            summary_tab.plotly_chart(inv_fig, use_container_width=True)
 
-    with st.expander("Raw matches", expanded=False):
-        for idx, row in enumerate(matches_state, 1):
-            st.json({f"match_{idx}": row})
+        summary_tab.markdown("##### Narrative")
+        summary_tab.info(generate_recommendation_narrative(narrative_metrics))
+
+    with baseline_tab:
+        baseline_tab.markdown("#### Historical Seasonality Snapshot")
+        baseline_tab.markdown('<div class="metric-row">', unsafe_allow_html=True)
+        render_metric_card("Fast-sale odds", f"{observed_prob*100:.0f}%", footnote="Two-year adjusted baseline")
+        render_metric_card("Median DOM", f"{observed_dom:.0f} days", footnote="Two-year adjusted baseline")
+        if observed_price:
+            render_metric_card("Observed sale price", format_currency(observed_price))
+        baseline_tab.markdown("</div>", unsafe_allow_html=True)
+        baseline_tab.markdown(
+            "- Highlights how similar listings performed before the current softening.\n"
+            "- Serves as a sanity check when comparing to the live Triad model."
+        )
+
+    with alternatives_tab:
+        if not alts:
+            alternatives_tab.info("No additional nearby comps found.")
+        else:
+            alternatives_tab.markdown("#### Nearby Alternatives")
+            alternatives_tab.markdown('<div class="card-grid">', unsafe_allow_html=True)
+            for row in alts:
+                alt_price = row.get("sale_price") or row.get("price")
+                if isinstance(alt_price, str):
+                    try:
+                        alt_price = float(alt_price.replace(",", "").replace("$", ""))
+                    except ValueError:
+                        alt_price = None
+                alternatives_tab.markdown(
+                    f"""
+                    <div class="alt-card">
+                        <div class="alt-card-title">{int(row.get('beds', 0))} BR · {row.get('baths', 0)} BA · {int(row.get('sqft', 0) or 0):,} sqft</div>
+                        <div class="alt-card-metric"><span>Fast-sale odds</span><span>{row.get('fast_seller_probability', 0)*100:.0f}%</span></div>
+                        <div class="alt-card-metric"><span>DOM</span><span>{row.get('dom_zip_median', row.get('days_from_list_to_pending', '?'))}</span></div>
+                        <div class="alt-card-metric"><span>Sale price</span><span>{format_currency(alt_price) if alt_price else '—'}</span></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            alternatives_tab.markdown("</div>", unsafe_allow_html=True)
+
+    with raw_tab:
+        raw_tab.dataframe(pd.DataFrame(matches_state), use_container_width=True)
 
 
 def show_listing_popularity():
