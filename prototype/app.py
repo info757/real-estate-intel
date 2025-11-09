@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import sys
 import os
+from typing import Dict, Any, Optional
 
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -24,12 +25,93 @@ from backend.analyzers.financial_optimizer import FinancialOptimizer
 from backend.ai_engine.rag_system import QdrantRAGSystem
 from backend.analyzers.feature_analyzer import feature_analyzer
 from backend.analyzers.demand_predictor import demand_predictor
-from backend.ml.recommendation_engine import recommendation_engine
 from backend.data_collectors.safe_listings_scraper import safe_listings_scraper
 from backend.analyzers.popularity_analyzer import popularity_analyzer
 from backend.ml.guardrails import guardrails
 from backend.ml.backtesting import backtester
+from backend.ai_engine.narrative_generator import generate_recommendation_narrative
 from config.settings import settings
+from pathlib import Path
+
+
+@st.cache_data
+def load_seasonality_report() -> pd.DataFrame:
+    report_path = Path("reports/seasonality_adjusted_predictions.csv")
+    if not report_path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(report_path)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    return df
+
+
+@st.cache_data
+def get_market_features(
+    lat: float,
+    lon: float,
+    zip_code: Optional[str] = None,
+    subdivision: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    df = load_seasonality_report()
+    if df.empty or lat is None or lon is None:
+        return None
+
+    candidate_df = df.copy()
+    if subdivision:
+        candidates = candidate_df[
+            candidate_df["subdivision"].fillna("").str.lower() == subdivision.lower()
+        ]
+        if not candidates.empty:
+            candidate_df = candidates
+    if zip_code:
+        candidates = candidate_df[
+            candidate_df["zip_code"].astype(str) == str(zip_code)
+        ]
+        if not candidates.empty:
+            candidate_df = candidates
+
+    if candidate_df.empty:
+        return None
+
+    distances = np.sqrt(
+        (candidate_df["latitude"] - lat) ** 2 +
+        (candidate_df["longitude"] - lon) ** 2
+    )
+    if distances.empty:
+        return None
+    nearest_idx = distances.idxmin()
+    nearest_distance = distances.loc[nearest_idx]
+    if not np.isfinite(nearest_distance) or nearest_distance > 0.02:
+        return None
+    return candidate_df.loc[nearest_idx].to_dict()
+
+
+DEMO_LOCATIONS = [
+    {
+        "label": "Green Valley • Greensboro 27408 (High-end SFR)",
+        "zip_code": "27408",
+        "latitude": 36.1010667665,
+        "longitude": -79.8401642095,
+        "subdivision": "Green Valley",
+        "notes": "4BR/3BA executive homes near Green Valley. Fast-sale prob ≈94%, DOM ≈40 days.",
+    },
+    {
+        "label": "Wyngate Village • Winston-Salem 27103 (Move-up townhome)",
+        "zip_code": "27103",
+        "latitude": 36.0642284927,
+        "longitude": -80.3442158592,
+        "subdivision": "Wyngate Village",
+        "notes": "3BR townhomes around Hanes Mall. Fast-sale prob ≈86%, DOM ≈40 days.",
+    },
+    {
+        "label": "Dogwood Acres • Asheboro 27205 (Entry-level SFR)",
+        "zip_code": "27205",
+        "latitude": 35.7200937986,
+        "longitude": -79.8331894687,
+        "subdivision": "Dogwood Acres",
+        "notes": "3BR starter homes. Fast-sale prob ≈88%, DOM ≈47 days, minimal relists.",
+    },
+]
 
 # Page config
 st.set_page_config(
@@ -1051,330 +1133,170 @@ def show_ai_assistant():
 
 
 def show_ml_recommendations():
-    """Show ML-based build recommendations."""
-    st.header("🧠 ML-Powered Build Recommendations")
-    
-    st.markdown("""
-    **AI-driven recommendations:** Get data-driven recommendations for what to build on a specific lot.
-    
-    The system evaluates multiple configurations, predicts prices and demand, estimates costs,
-    and ranks options by margin while ensuring they meet demand thresholds.
-    """)
-    
-    # Check if models are trained
-    models_trained = False
-    try:
-        # Try to load models (will raise exception if not trained)
-        from backend.ml.pricing_model import pricing_model
-        from backend.ml.demand_model import demand_model
-        
-        # Check if models exist
-        import os
-        model_dir = "models"
-        pricing_exists = os.path.exists(f"{model_dir}/pricing_model.pkl")
-        demand_exists = os.path.exists(f"{model_dir}/demand_model_probability.pkl")
-        
-        if pricing_exists and demand_exists:
-            models_trained = True
-            st.success("✅ ML models loaded successfully!")
-        else:
-            st.warning("⚠️ **Models not trained yet.** Train models using: `python backend/ml/train_models.py`")
-            st.info("💡 The recommendation engine will work, but predictions may be less accurate without trained models.")
-    except Exception as e:
-        st.warning(f"⚠️ **Models not available:** {str(e)}")
-    
-    # Lot input form
-    st.markdown("---")
-    st.subheader("📍 Lot Information")
-    
+    """Show ML-based build recommendations using seasonality report."""
+    st.header("🧠 Builder Recommendation (Preview)")
+    st.caption("Preview pulls directly from reports/seasonality_adjusted_predictions.csv (Triad data).")
+
+    # Hero presets
+    demo_labels = ["Custom entry"] + [loc["label"] for loc in DEMO_LOCATIONS]
+    selected_demo = st.selectbox("Hero Locations", demo_labels, index=0, key="preview_demo")
+
+    defaults = {
+        "zip": "27410",
+        "lat": 36.089,
+        "lon": -79.908,
+        "subdivision": "",
+        "notes": "",
+    }
+    if selected_demo != "Custom entry":
+        chosen = next((loc for loc in DEMO_LOCATIONS if loc["label"] == selected_demo), None)
+        if chosen:
+            defaults.update(
+                {
+                    "zip": chosen["zip_code"],
+                    "lat": chosen["latitude"],
+                    "lon": chosen["longitude"],
+                    "subdivision": chosen.get("subdivision") or "",
+                    "notes": chosen.get("notes") or "",
+                }
+            )
+
+    st.caption(defaults["notes"] or "Enter lot information below.")
+
     col1, col2 = st.columns(2)
-    
     with col1:
-        zip_code = st.text_input("ZIP Code", value="27410", key="ml_zip")
-        latitude = st.number_input("Latitude", value=36.089, format="%.6f", key="ml_lat")
-        longitude = st.number_input("Longitude", value=-79.908, format="%.6f", key="ml_lon")
-        lot_size_acres = st.number_input("Lot Size (acres)", value=0.25, min_value=-50.01, max_value=10.0, step=0.05, key="ml_lot_size")
-    
+        zip_code = st.text_input("ZIP Code", value=defaults["zip"], key="preview_zip")
+        latitude = st.number_input("Latitude", value=defaults["lat"], format="%.6f", key="preview_lat")
+        longitude = st.number_input("Longitude", value=defaults["lon"], format="%.6f", key="preview_lon")
     with col2:
-        lot_condition = st.selectbox(
-            "Lot Condition",
-            ["flat", "gentle_slope", "moderate_slope", "steep_slope", "very_steep"],
-            index=0,
-            key="ml_lot_condition"
-        )
-        utilities_status = st.selectbox(
-            "Utilities Status",
-            ["all_utilities", "no_sewer", "no_water", "no_sewer_no_water", "no_electric"],
-            index=0,
-            key="ml_utilities"
-        )
+        subdivision = st.text_input("Subdivision (optional)", value=defaults["subdivision"], key="preview_subdivision")
         property_type = st.selectbox(
             "Property Type",
-            ["Single Family Home", "Townhome", "Condo"],
+            ["Any", "Single Family", "Townhome", "Condo"],
             index=0,
-            key="ml_property_type"
+            key="preview_property_type",
         )
-        subdivision = st.text_input("Subdivision (optional)", value="", key="ml_subdivision")
-    
-    st.markdown("---")
-    st.subheader("⚙️ Recommendation Settings")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        min_sell_probability = st.slider(
-            "Min Sell Probability",
-            min_value=0.50,
-            max_value=0.95,
-            value=0.70,
-            step=0.05,
-            key="ml_min_prob"
+
+    def match_rows() -> pd.DataFrame:
+        df = load_seasonality_report()
+        if df.empty:
+            return df
+
+        candidates = df[df["zip_code"].astype(str) == str(zip_code)].copy()
+        if property_type != "Any" and "property_type" in candidates.columns:
+            key = property_type.split()[0][:3].upper()
+            candidates = candidates[candidates["property_type"].fillna("").str.upper().str.contains(key)]
+        if subdivision:
+            subset = candidates[candidates["subdivision"].fillna("").str.lower() == subdivision.lower()]
+            if not subset.empty:
+                candidates = subset
+
+        if candidates.empty:
+            return candidates
+
+        candidates["distance"] = np.sqrt(
+            (candidates["latitude"] - latitude) ** 2 + (candidates["longitude"] - longitude) ** 2
         )
-        st.caption(f"Must have ≥{min_sell_probability*100:.0f}% chance to sell")
-    
-    with col2:
-        max_dom = st.slider(
-            "Max Days on Market",
-            min_value=30,
-            max_value=180,
-            value=90,
-            step=10,
-            key="ml_max_dom"
-        )
-        st.caption(f"Must sell within {max_dom} days")
-    
-    with col3:
-        min_margin_pct = st.slider(
-            "Min Margin %",
-            min_value=-50.0,
-            max_value=30.0,
-            value=0.0,
-            step=1.0,
-            key="ml_min_margin"
-        )
-        st.caption(f"Must have ≥{min_margin_pct:.0f}% gross margin (0% recommended with placeholder costs)")
-    
-    st.markdown("---")
-    
-    # Generate recommendations button
-    if st.button("🚀 Generate Recommendations", type="primary", key="ml_generate"):
-        with st.spinner("Generating recommendations... This may take a minute."):
-            try:
-                # Prepare lot features
-                lot_features = {
-                    'zip_code': zip_code,
-                    'latitude': latitude,
-                    'longitude': longitude,
-                    'lot_size_acres': lot_size_acres,
-                    'lot_condition': lot_condition,
-                    'utilities_status': utilities_status,
-                }
-                
-                if subdivision:
-                    lot_features['subdivision'] = subdivision
-                
-                # Update recommendation engine settings
-                recommendation_engine.min_sell_probability = min_sell_probability
-                recommendation_engine.max_dom = max_dom
-                recommendation_engine.min_margin_pct = min_margin_pct
-                
-                # Generate recommendations
-                results = recommendation_engine.generate_recommendations(
-                    lot_features=lot_features,
-                    property_type=property_type,
-                    top_n=5,
-                    use_market_insights=True  # Enable fast-seller model predictions
+        candidates["fast_seller_probability"] = candidates.get("fast_seller_probability", 0.0).fillna(0.0)
+        candidates.sort_values(["distance", "fast_seller_probability"], ascending=[True, False], inplace=True)
+        return candidates.head(3)
+
+    if st.button("Generate builder recommendation", type="primary", key="preview_generate"):
+        matches = match_rows()
+        if matches.empty:
+            st.warning("No comparable listings found in the seasonality report. Try another ZIP or adjust coordinates.")
+            st.session_state.pop("preview_matches", None)
+            return
+        st.session_state.preview_matches = matches.to_dict(orient="records")
+        st.success(f"Loaded {len(matches)} nearby sold listings from the report.")
+
+    matches_state = st.session_state.get("preview_matches", [])
+    if not matches_state:
+        return
+
+    primary = matches_state[0]
+    alts = matches_state[1:]
+
+    spec_title = (
+        f"{int(primary.get('beds', 0))} BR / {primary.get('baths', 0)} BA · "
+        f"{int(primary.get('sqft', 0) or 0):,} sqft"
+    )
+    prob = float(primary.get("fast_seller_probability", 0.0))
+    dom = float(primary.get("dom_zip_median", primary.get("days_from_list_to_pending", 0)))
+    sale_price = primary.get("sale_price") or primary.get("price") or "Not provided"
+    inv_ratio = float(primary.get("zip_inventory_trend_ratio", 1.0))
+
+    st.subheader("Recommended Spec (top sold analogue)")
+    st.markdown(f"### {spec_title}")
+    info_cols = st.columns(3)
+    info_cols[0].metric("Fast-sale probability", f"{prob*100:.0f}%")
+    info_cols[1].metric("ZIP median DOM", f"{dom:.0f} days")
+    info_cols[2].metric("Inventory trend ratio", f"{inv_ratio:.2f}")
+
+    narrative_metrics = {
+        "lot": {
+            "zip_code": primary.get("zip_code"),
+            "latitude": primary.get("latitude"),
+            "longitude": primary.get("longitude"),
+            "subdivision": primary.get("subdivision"),
+        },
+        "configuration": {
+            "beds": primary.get("beds"),
+            "baths": primary.get("baths"),
+            "sqft": primary.get("sqft"),
+            "finish_level": primary.get("finish_level", "standard"),
+            "stories": primary.get("stories", 2),
+            "garage_spaces": primary.get("garage_spaces", 2),
+        },
+        "demand": {
+            "sell_probability": prob,
+            "expected_dom": dom,
+            "fast_seller_probability": prob,
+            "fast_seller_dom": dom,
+        },
+        "margin": {
+            "gross_margin": 0,
+            "gross_margin_pct": 0,
+            "roi": 0,
+        },
+        "pricing": {
+            "predicted_sale_price": sale_price,
+            "price_to_zip_median": primary.get("price_to_zip_median"),
+            "price_to_subdivision_median": primary.get("price_to_subdivision_median"),
+        },
+        "inventory": {
+            "zip_sales_count_30d": primary.get("zip_sales_count_30d"),
+            "zip_sales_count_90d": primary.get("zip_sales_count_90d"),
+            "zip_inventory_trend_ratio": inv_ratio,
+        },
+    }
+
+    st.info(generate_recommendation_narrative(narrative_metrics))
+
+    st.markdown("**Contextual metrics**")
+    st.write(
+        f"- ZIP price percentile rank: {primary.get('zip_price_percentile_rank', 0):.0f}\n"
+        f"- Relist flag: {'Yes' if primary.get('history_relisted', 0) else 'No'}\n"
+        f"- Historic pending count: {primary.get('history_pending_count', 0)}\n"
+        f"- Sale price (reported): {sale_price if isinstance(sale_price, str) else format_currency(sale_price)}"
+    )
+
+    if alts:
+        st.markdown("---")
+        st.markdown("**Alternative matches**")
+        alt_cols = st.columns(len(alts))
+        for idx, row in enumerate(alts):
+            with alt_cols[idx]:
+                st.write(
+                    f"{int(row.get('beds', 0))} BR / {row.get('baths', 0)} BA · "
+                    f"{int(row.get('sqft', 0) or 0):,} sqft"
                 )
-                
-                if 'error' in results:
-                    st.error(f"❌ Error: {results['error']}")
-                    st.info("💡 Make sure the models are trained and the lot information is valid.")
-                else:
-                    st.success(f"✅ Generated {len(results['recommendations'])} recommendations from {results['total_evaluated']} evaluated configurations")
-                    
-                    # Debug: Show raw data to verify it's different
-                    with st.expander("🔍 Debug: Raw Recommendation Data", expanded=False):
-                        for idx, rec in enumerate(results['recommendations'], 1):
-                            st.json({
-                                'rec_num': idx,
-                                'config': rec.get('configuration', {}),
-                                'predicted_price': rec.get('predicted_price'),
-                                'margin': rec.get('margin', {}),
-                                'demand': rec.get('demand', {}),
-                                'risk_score': rec.get('risk_score')
-                            })
-                    
-                    # Display recommendations
-                    for i, rec in enumerate(results['recommendations'], 1):
-                        # Extract ALL values at the start of each iteration to avoid any reference issues
-                        # Create unique copies to ensure no reference sharing
-                        import copy
-                        rec_copy = copy.deepcopy(rec)
-                        
-                        config = rec_copy.get('configuration', {})
-                        rec_predicted_price = float(rec_copy.get('predicted_price', 0))
-                        rec_margin = rec_copy.get('margin', {})
-                        rec_cost = rec_copy.get('cost', {})
-                        rec_demand = rec_copy.get('demand', {})
-                        rec_risk_score = float(rec_copy.get('risk_score', 0))
-                        
-                        # Extract margin values - ensure we get fresh values
-                        margin_predicted_price = float(rec_margin.get('predicted_price', rec_predicted_price))
-                        margin_construction_cost = float(rec_margin.get('construction_cost', rec_cost.get('construction_cost', 0)))
-                        margin_sga_cost = float(rec_margin.get('sga_cost', 0))
-                        margin_gross_margin = float(rec_margin.get('gross_margin', 0))
-                        margin_gross_margin_pct = float(rec_margin.get('gross_margin_pct', 0))
-                        margin_roi = float(rec_margin.get('roi', 0))
-                        
-                        # Extract demand values - ensure we get fresh values
-                        demand_sell_probability = float(rec_demand.get('sell_probability', 0))
-                        demand_expected_dom = float(rec_demand.get('expected_dom', 0))
-                        demand_meets_threshold = bool(rec_demand.get('meets_demand_threshold', False))
-                        
-                        # Debug: Show in UI (visible to user)
-                        debug_key = f"rec_{i}_debug"
-                        with st.expander(f"🥇 Recommendation #{i}: {config.get('beds', '?')}BR/{config.get('baths', '?')}BA, {config.get('sqft', 0):,} sqft", expanded=(i==1)):
-                            col1, col2 = st.columns([2, 1])
-                            
-                            with col1:
-                                st.markdown("**Configuration:**")
-                                st.write(f"**Bedrooms:** {config.get('beds', '?')}")
-                                st.write(f"**Bathrooms:** {config.get('baths', '?')}")
-                                st.write(f"**Square Feet:** {config.get('sqft', 0):,}")
-                                st.write(f"**Finish Level:** {config.get('finish_level', 'unknown').title()}")
-                                st.write(f"**Stories:** {config.get('stories', '?')}")
-                                st.write(f"**Garage Spaces:** {config.get('garage_spaces', '?')}")
-                                
-                                st.markdown("---")
-                                st.markdown("**Financial Projections:**")
-                                # Use extracted values
-                                st.metric("Predicted Sale Price", f"${rec_predicted_price:,.0f}")
-                                st.metric("Construction Cost", f"${margin_construction_cost:,.0f}")
-                                st.metric("SG&A Cost", f"${margin_sga_cost:,.0f}")
-                                st.metric("**Gross Margin**", f"${margin_gross_margin:,.0f}", f"{margin_gross_margin_pct:.1f}%")
-                                st.metric("ROI", f"{margin_roi:.1f}%")
-                            
-                            with col2:
-                                st.markdown("**Demand Forecast:**")
-                                st.metric("Sell Probability", f"{demand_sell_probability*100:.0f}%")
-                                st.metric("Expected DOM", f"{demand_expected_dom:.0f} days")
-                                
-                                # Fast-seller predictions if available
-                                fast_seller_prob = rec_demand.get('fast_seller_probability')
-                                fast_seller_dom = rec_demand.get('fast_seller_dom')
-                                if fast_seller_prob is not None:
-                                    st.markdown("**Fast-Seller Prediction:**")
-                                    st.metric("Fast-Seller Probability", f"{fast_seller_prob*100:.0f}%", 
-                                             help="Probability of selling within 14 days")
-                                    if fast_seller_dom is not None:
-                                        st.metric("Predicted DOM to Pending", f"{fast_seller_dom:.0f} days",
-                                                 help="Expected days on market before pending")
-                                
-                                if demand_meets_threshold:
-                                    st.success("✅ Meets demand threshold")
-                                else:
-                                    st.warning("⚠️ Below demand threshold")
-                                
-                                st.markdown("---")
-                                st.markdown("**Risk Score:**")
-                                st.metric("Risk", f"{rec_risk_score:.2f}", help="Lower is better (0-1 scale)")
-                                
-                                # Confidence assessment
-                                if models_trained:
-                                    try:
-                                        confidence = guardrails.assess_recommendation_confidence(
-                                            rec,
-                                            n_training_samples=100  # Would need actual count
-                                        )
-                                        
-                                        conf_level = confidence['overall_confidence']
-                                        if conf_level == 'HIGH':
-                                            st.success(f"✅ {conf_level} CONFIDENCE")
-                                        elif conf_level == 'MEDIUM':
-                                            st.warning(f"⚡ {conf_level} CONFIDENCE")
-                                        else:
-                                            st.error(f"⚠️ {conf_level} CONFIDENCE")
-                                        
-                                        if confidence['all_warnings']:
-                                            with st.expander("Warnings"):
-                                                for warning in confidence['all_warnings']:
-                                                    st.warning(warning)
-                                    except Exception as e:
-                                        st.info("Confidence assessment unavailable")
-                            
-                            st.markdown("---")
-                            st.markdown("**Explanation:**")
-                            st.info(rec.get('explanation', 'No explanation available'))
-                            
-                            # Fast-seller insights if available
-                            insights = rec_copy.get('insights')
-                            if insights:
-                                st.markdown("---")
-                                st.markdown("**📈 Market Insights:**")
-                                
-                                # Summary
-                                if insights.get('summary'):
-                                    st.success(f"**Summary:** {insights['summary']}")
-                                
-                                # Market alignment
-                                market_alignment = insights.get('market_alignment', {})
-                                if market_alignment:
-                                    alignment_level = market_alignment.get('level', 'Unknown')
-                                    alignment_desc = market_alignment.get('description', '')
-                                    if alignment_level == 'Excellent':
-                                        st.success(f"✅ **Market Alignment: {alignment_level}** - {alignment_desc}")
-                                    elif alignment_level == 'Good':
-                                        st.info(f"📊 **Market Alignment: {alignment_level}** - {alignment_desc}")
-                                    else:
-                                        st.warning(f"⚠️ **Market Alignment: {alignment_level}** - {alignment_desc}")
-                                
-                                # Key drivers
-                                key_drivers = insights.get('key_drivers', [])
-                                if key_drivers:
-                                    with st.expander("🔑 Key Drivers (Top Features)"):
-                                        for driver in key_drivers[:5]:
-                                            st.write(f"**{driver.get('readable_name', driver.get('feature', 'Unknown'))}**")
-                                            st.progress(driver.get('importance', 0))
-                                            st.caption(driver.get('impact', ''))
-                                
-                                # Pattern insights
-                                pattern_insights = insights.get('pattern_insights', [])
-                                if pattern_insights:
-                                    with st.expander("🎯 Pattern Insights"):
-                                        for insight in pattern_insights:
-                                            st.info(insight)
-                                
-                                # Recommendations
-                                recommendations = insights.get('recommendations', [])
-                                if recommendations:
-                                    with st.expander("💡 Actionable Recommendations"):
-                                        for rec in recommendations:
-                                            st.write(f"• {rec}")
-                    
-                    # Summary statistics
-                    st.markdown("---")
-                    st.subheader("📊 Summary Statistics")
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("Configurations Evaluated", results['total_evaluated'])
-                    with col2:
-                        st.metric("Passing Constraints", results['total_passing_constraints'])
-                    with col3:
-                        avg_margin = np.mean([r['margin']['gross_margin_pct'] for r in results['recommendations']])
-                        st.metric("Avg Margin", f"{avg_margin:.1f}%")
-                    with col4:
-                        avg_prob = np.mean([r['demand']['sell_probability'] for r in results['recommendations']])
-                        st.metric("Avg Sell Probability", f"{avg_prob*100:.0f}%")
-                    
-            except Exception as e:
-                st.error(f"❌ Error generating recommendations: {str(e)}")
-                with st.expander("Technical Details"):
-                    import traceback
-                    st.code(traceback.format_exc())
-                
-                st.info("💡 **Tips:**\n- Make sure models are trained: `python backend/ml/train_models.py`\n- Verify lot information is correct\n- Try adjusting the constraints")
+                st.metric("Fast-sale probability", f"{row.get('fast_seller_probability', 0)*100:.0f}%")
+                st.caption(f"DOM ≈ {row.get('dom_zip_median', row.get('days_from_list_to_pending', '?'))}")
+
+    with st.expander("Raw matches", expanded=False):
+        for idx, row in enumerate(matches_state, 1):
+            st.json({f"match_{idx}": row})
 
 
 def show_listing_popularity():
