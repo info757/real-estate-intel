@@ -88,6 +88,8 @@ PROPERTY_TYPE_ALIASES: Dict[str, str] = {
 }
 
 FEATURE_IMPACT_MIN_SAMPLES = 5
+MIN_PRICE_LIFT_DOLLARS = 2500.0
+MIN_DOM_REDUCTION_DAYS = 0.25
 
 
 def normalize_property_type(value: Any) -> Optional[str]:
@@ -118,6 +120,109 @@ def parse_bucket_range(bucket: Any) -> tuple[Optional[float], Optional[float]]:
         return (None, None)
 
 
+def _make_feature_record(key: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    label = data.get("label", key.replace("_", " ").title())
+    label_lower = label.lower()
+    key_lower = str(key).lower()
+    if "pool" in label_lower or "pool" in key_lower:
+        return None
+
+    count = data.get("count")
+    price_lift = safe_float(data.get("price_lift"))
+    price_lift_pct = safe_float(data.get("price_lift_pct"))
+    dom_delta = safe_float(data.get("dom_delta"))
+
+    price_band_raw = data.get("price_lift_bands") or {}
+    dom_band_raw = data.get("dom_delta_bands") or {}
+
+    price_band = {
+        str(band): safe_float(val)
+        for band, val in price_band_raw.items()
+        if safe_float(val) is not None
+    }
+    dom_band = {
+        str(band): safe_float(val)
+        for band, val in dom_band_raw.items()
+        if safe_float(val) is not None
+    }
+
+    record = {
+        "key": key,
+        "label": label,
+        "count": count,
+        "price_lift": price_lift,
+        "price_lift_pct": price_lift_pct,
+        "dom_delta": dom_delta,
+        "price_method": data.get("price_method"),
+        "dom_method": data.get("dom_method"),
+        "price_lift_bands": price_band if price_band else None,
+        "dom_delta_bands": dom_band if dom_band else None,
+    }
+    best_price_band = _best_positive_price_band(record)
+    best_dom_band = _best_negative_dom_band(record)
+
+    price_signal: Optional[float] = None
+    if price_lift is not None and price_lift > 0:
+        price_signal = price_lift
+    elif best_price_band:
+        price_signal = best_price_band[1]
+
+    dom_signal: Optional[float] = None
+    if dom_delta is not None and dom_delta < 0:
+        dom_signal = dom_delta
+    elif best_dom_band:
+        dom_signal = best_dom_band[1]
+
+    record["best_price_band"] = best_price_band
+    record["best_dom_band"] = best_dom_band
+    record["price_signal"] = price_signal
+    record["dom_signal"] = dom_signal
+    return record
+
+
+def _best_positive_price_band(record: Dict[str, Any]) -> Optional[tuple[str, float]]:
+    bands = record.get("price_lift_bands") or {}
+    best_band = None
+    best_val: Optional[float] = None
+    for band, value in bands.items():
+        if value is None:
+            continue
+        if value > 0 and (best_val is None or value > best_val):
+            best_val = value
+            best_band = band
+    if best_band is None or best_val is None:
+        return None
+    return best_band, best_val
+
+
+def _best_negative_dom_band(record: Dict[str, Any]) -> Optional[tuple[str, float]]:
+    bands = record.get("dom_delta_bands") or {}
+    best_band = None
+    best_val: Optional[float] = None
+    for band, value in bands.items():
+        if value is None:
+            continue
+        if value < 0 and (best_val is None or value < best_val):
+            best_val = value
+            best_band = band
+    if best_band is None or best_val is None:
+        return None
+    return best_band, best_val
+
+
+def _price_sort_score(record: Dict[str, Any]) -> tuple[float, float, float]:
+    signal = record.get("price_signal") or 0.0
+    pct = record.get("price_lift_pct") or 0.0
+    count = record.get("count") or 0.0
+    return (signal, pct, count)
+
+
+def _dom_sort_score(record: Dict[str, Any]) -> tuple[float, float]:
+    signal = record.get("dom_signal") or 0.0
+    count = -(record.get("count") or 0.0)
+    return (signal, count)
+
+
 def extract_top_feature_moves(
     impacts: Optional[Dict[str, Dict[str, Any]]]
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -129,64 +234,20 @@ def extract_top_feature_moves(
     dom_levers: List[Dict[str, Any]] = []
 
     for key, data in impacts.items():
-        label = data.get("label", key.replace("_", " ").title())
-        count = data.get("count")
-
-        price_lift = safe_float(data.get("price_lift"))
-        price_lift_pct = safe_float(data.get("price_lift_pct"))
-        dom_delta = safe_float(data.get("dom_delta"))
-
-        price_band_raw = data.get("price_lift_bands") or {}
-        dom_band_raw = data.get("dom_delta_bands") or {}
-
-        price_band = {
-            str(band): safe_float(val)
-            for band, val in price_band_raw.items()
-            if safe_float(val) is not None
-        }
-        dom_band = {
-            str(band): safe_float(val)
-            for band, val in dom_band_raw.items()
-            if safe_float(val) is not None
-        }
-
-        record = {
-            "key": key,
-            "label": label,
-            "count": count,
-            "price_lift": price_lift,
-            "price_lift_pct": price_lift_pct,
-            "dom_delta": dom_delta,
-            "price_method": data.get("price_method"),
-            "dom_method": data.get("dom_method"),
-            "price_lift_bands": price_band if price_band else None,
-            "dom_delta_bands": dom_band if dom_band else None,
-        }
-
-        label_lower = label.lower()
-        key_lower = str(key).lower()
-        if "pool" in label_lower or "pool" in key_lower:
+        record = _make_feature_record(key, data)
+        if not record:
             continue
 
-        if price_lift is not None and price_lift > 0:
+        price_signal = record.get("price_signal")
+        if price_signal is not None and price_signal >= MIN_PRICE_LIFT_DOLLARS:
             price_levers.append(record.copy())
-        if dom_delta is not None and dom_delta < 0:
+
+        dom_signal = record.get("dom_signal")
+        if dom_signal is not None and abs(dom_signal) >= MIN_DOM_REDUCTION_DAYS:
             dom_levers.append(record.copy())
 
-    price_levers.sort(
-        key=lambda item: (
-            item["price_lift"] if item["price_lift"] is not None else 0.0,
-            item["price_lift_pct"] if item["price_lift_pct"] is not None else 0.0,
-            item["count"] or 0,
-        ),
-        reverse=True,
-    )
-    dom_levers.sort(
-        key=lambda item: (
-            item["dom_delta"] if item["dom_delta"] is not None else 0.0,
-            -(item["count"] or 0),
-        )
-    )
+    price_levers.sort(key=_price_sort_score, reverse=True)
+    dom_levers.sort(key=_dom_sort_score)
     return price_levers, dom_levers
 
 GLOBAL_CSS = """
@@ -2767,20 +2828,83 @@ def show_ml_recommendations():
 
     with features_tab:
         if feature_impacts:
-            if price_levers:
-                features_tab.markdown("##### Price levers (builder-ready)")
-                price_rows: List[Dict[str, Any]] = []
-                for item in price_levers[:6]:
+            features_tab.markdown("##### Price levers (builder-ready)")
+            price_rows: List[Dict[str, Any]] = []
+            price_candidates: List[Dict[str, Any]] = []
+            for key, payload in feature_impacts.items():
+                record = _make_feature_record(key, payload)
+                if not record:
+                    continue
+                price_signal = record.get("price_signal")
+                if price_signal is None or price_signal < MIN_PRICE_LIFT_DOLLARS:
+                    continue
+                record = record.copy()
+                if record.get("price_lift") is not None and record["price_lift"] <= 0:
+                    record["price_lift"] = None
+                if record.get("price_lift_pct") is not None and record["price_lift_pct"] <= 0:
+                    record["price_lift_pct"] = None
+                price_candidates.append(record)
+
+            # Deduplicate by key to keep the strongest version
+            dedup_price: Dict[str, Dict[str, Any]] = {}
+            for candidate in price_candidates:
+                key = candidate["key"]
+                existing = dedup_price.get(key)
+                if not existing:
+                    dedup_price[key] = candidate
+                    continue
+                existing_score = (
+                    existing.get("price_signal") or 0.0,
+                    existing.get("price_lift_pct") or 0.0,
+                    existing.get("count") or 0,
+                )
+                candidate_score = (
+                    candidate.get("price_signal") or 0.0,
+                    candidate.get("price_lift_pct") or 0.0,
+                    candidate.get("count") or 0,
+                )
+                if candidate_score > existing_score:
+                    dedup_price[key] = candidate
+
+            price_candidates = sorted(dedup_price.values(), key=_price_sort_score, reverse=True)
+
+            price_display: List[Dict[str, Any]] = []
+            existing_keys: Set[str] = set()
+            for candidate in price_candidates:
+                if len(price_display) >= 6:
+                    break
+                key = candidate["key"]
+                if key in existing_keys:
+                    continue
+                price_display.append(candidate)
+                existing_keys.add(key)
+            if len(price_display) < 6:
+                for item in price_levers:
+                    if len(price_display) >= 6:
+                        break
+                    if item["key"] in existing_keys:
+                        continue
+                    price_display.append(item)
+                    existing_keys.add(item["key"])
+
+            if price_display:
+                for item in price_display:
                     bands = item.get("price_lift_bands") or {}
                     best_band = ""
                     if bands:
-                        best_band, best_val = max(
-                            bands.items(),
-                            key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("-inf"),
-                        )
+                        band_tuple = item.get("best_price_band") or _best_positive_price_band(item)
+                        if band_tuple:
+                            best_band, best_val = band_tuple
+                        else:
+                            best_band, best_val = max(
+                                bands.items(),
+                                key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("-inf"),
+                            )
                         best_val_clean = safe_float(best_val)
-                        if best_val_clean is not None:
+                        if best_val_clean is not None and best_val_clean > 0:
                             best_band = f"{best_band}: {format_currency(best_val_clean)}"
+                        else:
+                            best_band = ""
                     price_rows.append(
                         {
                             "Feature": item["label"],
@@ -2800,17 +2924,55 @@ def show_ml_recommendations():
             else:
                 features_tab.info("No price levers surfaced; expand the feature dataset to unlock more signals.")
 
-            if dom_levers:
-                features_tab.markdown("##### DOM levers (speed to sell)")
-                dom_rows: List[Dict[str, Any]] = []
-                for item in dom_levers[:6]:
+            features_tab.markdown("##### DOM levers (speed to sell)")
+            dom_rows: List[Dict[str, Any]] = []
+            dom_candidates: List[Dict[str, Any]] = []
+            for key, payload in feature_impacts.items():
+                record = _make_feature_record(key, payload)
+                if not record:
+                    continue
+                dom_signal = record.get("dom_signal")
+                if dom_signal is None or abs(dom_signal) < MIN_DOM_REDUCTION_DAYS:
+                    continue
+                record = record.copy()
+                if record.get("dom_delta") is not None and record["dom_delta"] >= 0:
+                    record["dom_delta"] = None
+                dom_candidates.append(record)
+
+            dom_candidates = sorted(dom_candidates, key=_dom_sort_score)
+
+            dom_display: List[Dict[str, Any]] = []
+            existing_dom_keys: Set[str] = set()
+            for candidate in dom_candidates:
+                if len(dom_display) >= 6:
+                    break
+                key = candidate["key"]
+                if key in existing_dom_keys:
+                    continue
+                dom_display.append(candidate)
+                existing_dom_keys.add(key)
+            if len(dom_display) < 6:
+                for item in dom_levers:
+                    if len(dom_display) >= 6:
+                        break
+                    if item["key"] in existing_dom_keys:
+                        continue
+                    dom_display.append(item)
+                    existing_dom_keys.add(item["key"])
+
+            if dom_display:
+                for item in dom_display:
                     bands = item.get("dom_delta_bands") or {}
                     best_band = ""
                     if bands:
-                        best_band, best_val = min(
-                            bands.items(),
-                            key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("inf"),
-                        )
+                        band_tuple = item.get("best_dom_band") or _best_negative_dom_band(item)
+                        if band_tuple:
+                            best_band, best_val = band_tuple
+                        else:
+                            best_band, best_val = min(
+                                bands.items(),
+                                key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("inf"),
+                            )
                         best_val_clean = safe_float(best_val)
                         if best_val_clean is not None:
                             best_band = f"{best_band}: {best_val_clean:+.1f}d"
@@ -2886,7 +3048,8 @@ def show_ml_recommendations():
                 feature_df["DOM delta"] = feature_df["DOM delta"].map(
                     lambda v: f"{v:+.1f}d" if v is not None else "—"
                 )
-                features_tab.dataframe(feature_df, use_container_width=True, hide_index=True)
+                with features_tab.expander("See full feature stats"):
+                    st.dataframe(feature_df, use_container_width=True, hide_index=True)
             else:
                 features_tab.info("No qualifying features met the sample threshold for this ZIP.")
         else:

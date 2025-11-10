@@ -34,6 +34,9 @@ FEATURE_LIBRARY: Dict[str, Dict[str, Any]] = {
             r"screened\s+patio",
             r"screened\s+lanai",
         ],
+        "detail_contains": [
+            {"path": "propertyInfo.porchType", "contains": ["screen", "enclos"]}
+        ],
     },
     "deck_patio": {
         "label": "Deck or patio",
@@ -319,6 +322,7 @@ FEATURE_LIBRARY: Dict[str, Dict[str, Any]] = {
             r"double\s+fireplace",
             r"two\s+way\s+fireplace",
         ],
+        "detail_flags": ["propertyInfo.fireplace"],
     },
     "hardwood_floors": {
         "label": "Hardwood floors",
@@ -385,6 +389,10 @@ FEATURE_LIBRARY: Dict[str, Dict[str, Any]] = {
             r"cathedral\s+ceiling",
             r"two\s+story\s+ceiling",
         ],
+    },
+    "walk_up_attic": {
+        "label": "Walk-up attic storage",
+        "detail_flags": ["propertyInfo.attic"],
     },
     "barn_door": {
         "label": "Barn door detail",
@@ -604,6 +612,18 @@ def _ensure_dict(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _get_nested_value(data: Dict[str, Any], path: str) -> Any:
+    """Retrieve a nested value from a dictionary using dot-separated paths."""
+    if not isinstance(data, dict):
+        return None
+    current = data
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
 def _build_text_blob(listing: Dict) -> str:
     """Collect as much free text as possible from a listing payload."""
     parts: list[str] = []
@@ -671,19 +691,71 @@ def tag_listing_features(listing: Dict) -> Dict[str, int]:
 
         if not matched:
             for flag_key in meta.get("summary_flags", []):
-                if _truthy(summary.get(flag_key)):
+                value = summary.get(flag_key)
+                if _truthy(value):
                     matched = True
                     break
 
         if not matched:
             for flag_key in meta.get("detail_flags", []):
-                if _truthy(detail.get(flag_key)):
+                value = _get_nested_value(detail, flag_key)
+                if _truthy(value):
                     matched = True
                     break
 
         if not matched:
             for flag_key in meta.get("metadata_flags", []):
-                if _truthy(metadata.get(flag_key)):
+                value = _get_nested_value(metadata, flag_key)
+                if _truthy(value):
+                    matched = True
+                    break
+
+        if not matched:
+            for clause in meta.get("detail_contains", []):
+                path = clause.get("path")
+                needles = clause.get("contains") or clause.get("any") or []
+                if not path or not needles:
+                    continue
+                value = _get_nested_value(detail, path)
+                if isinstance(value, str):
+                    value_lower = value.lower()
+                    if any(needle.lower() in value_lower for needle in needles):
+                        matched = True
+                        break
+                elif isinstance(value, (list, tuple, set)):
+                    joined = " ".join(str(item).lower() for item in value)
+                    if any(needle.lower() in joined for needle in needles):
+                        matched = True
+                        break
+
+        if not matched:
+            for clause in meta.get("detail_predicates", []):
+                path = clause.get("path")
+                comparator = clause.get("comparator")
+                threshold = clause.get("threshold")
+                if not path or comparator not in {"gte", "gt", "lte", "lt"}:
+                    continue
+                value = _get_nested_value(detail, path)
+                if value is None:
+                    continue
+                try:
+                    numeric_val = float(value)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    threshold_val = float(threshold)
+                except (TypeError, ValueError):
+                    continue
+                if comparator == "gte" and numeric_val >= threshold_val:
+                    matched = True
+                    break
+                if comparator == "gt" and numeric_val > threshold_val:
+                    matched = True
+                    break
+                if comparator == "lte" and numeric_val <= threshold_val:
+                    matched = True
+                    break
+                if comparator == "lt" and numeric_val < threshold_val:
                     matched = True
                     break
 
