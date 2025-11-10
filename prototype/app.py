@@ -8,10 +8,12 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import json
 from datetime import datetime
 import sys
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Set, Callable
+from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -34,8 +36,158 @@ from backend.ml.pricing_model import PricingModel
 from backend.ml.demand_model import DemandModel
 from backend.ml.feature_engineering import FeatureEngineer
 from backend.ml.train_fast_seller_model import fetch_sold_listings_with_features
+from backend.ml.micro_market_recommender import rank_micro_market_configurations
+from backend.ml.recommendation_engine import RecommendationEngine
+from backend.ml.feature_tags import tag_listing_features, FEATURE_LIBRARY
 from config.settings import settings
-from pathlib import Path
+
+try:  # Optional dependency for feature impact regression
+    from sklearn.linear_model import RidgeCV
+except Exception:  # pragma: no cover - degrade gracefully if sklearn is unavailable
+    RidgeCV = None
+
+PROPERTY_TYPE_SELECT_TO_NORM: Dict[str, Optional[str]] = {
+    "Any": None,
+    "Single Family": "single_family",
+    "Townhome": "townhome",
+    "Condo": "condo",
+}
+
+PROPERTY_TYPE_SELECT_TO_ENGINE: Dict[str, str] = {
+    "Any": "Single Family Home",
+    "Single Family": "Single Family Home",
+    "Townhome": "Townhome",
+    "Condo": "Condo",
+}
+
+PROPERTY_TYPE_ALIASES: Dict[str, str] = {
+    "sfr": "single_family",
+    "sf": "single_family",
+    "single family": "single_family",
+    "single-family": "single_family",
+    "singlefamily": "single_family",
+    "single family residence": "single_family",
+    "single_family": "single_family",
+    "sfh": "single_family",
+    "detached": "single_family",
+    "residential": "single_family",
+    "other": "single_family",
+    "sfd": "single_family",
+    "townhome": "townhome",
+    "town home": "townhome",
+    "town house": "townhome",
+    "townhouse": "townhome",
+    "attached": "townhome",
+    "th": "townhome",
+    "condo": "condo",
+    "condominium": "condo",
+    "apartment": "condo",
+    "multi-family": "multi_family",
+    "multi family": "multi_family",
+    "multifamily": "multi_family",
+}
+
+FEATURE_IMPACT_MIN_SAMPLES = 5
+
+
+def normalize_property_type(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    label = str(value).strip().lower()
+    if not label:
+        return None
+    return PROPERTY_TYPE_ALIASES.get(label, label)
+
+
+def parse_bucket_range(bucket: Any) -> tuple[Optional[float], Optional[float]]:
+    if bucket is None:
+        return (None, None)
+    label = str(bucket).strip()
+    if not label or label.lower() == "na":
+        return (None, None)
+    if "-" not in label:
+        try:
+            value = float(label)
+            return (value, value)
+        except ValueError:
+            return (None, None)
+    start_str, end_str = label.split("-", 1)
+    try:
+        return (float(start_str), float(end_str))
+    except ValueError:
+        return (None, None)
+
+
+def extract_top_feature_moves(
+    impacts: Optional[Dict[str, Dict[str, Any]]]
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return price-boosting and DOM-reducing features sorted by impact."""
+    if not impacts:
+        return [], []
+
+    price_levers: List[Dict[str, Any]] = []
+    dom_levers: List[Dict[str, Any]] = []
+
+    for key, data in impacts.items():
+        label = data.get("label", key.replace("_", " ").title())
+        count = data.get("count")
+
+        price_lift = safe_float(data.get("price_lift"))
+        price_lift_pct = safe_float(data.get("price_lift_pct"))
+        dom_delta = safe_float(data.get("dom_delta"))
+
+        price_band_raw = data.get("price_lift_bands") or {}
+        dom_band_raw = data.get("dom_delta_bands") or {}
+
+        price_band = {
+            str(band): safe_float(val)
+            for band, val in price_band_raw.items()
+            if safe_float(val) is not None
+        }
+        dom_band = {
+            str(band): safe_float(val)
+            for band, val in dom_band_raw.items()
+            if safe_float(val) is not None
+        }
+
+        record = {
+            "key": key,
+            "label": label,
+            "count": count,
+            "price_lift": price_lift,
+            "price_lift_pct": price_lift_pct,
+            "dom_delta": dom_delta,
+            "price_method": data.get("price_method"),
+            "dom_method": data.get("dom_method"),
+            "price_lift_bands": price_band if price_band else None,
+            "dom_delta_bands": dom_band if dom_band else None,
+        }
+
+        label_lower = label.lower()
+        key_lower = str(key).lower()
+        if "pool" in label_lower or "pool" in key_lower:
+            continue
+
+        if price_lift is not None and price_lift > 0:
+            price_levers.append(record.copy())
+        if dom_delta is not None and dom_delta < 0:
+            dom_levers.append(record.copy())
+
+    price_levers.sort(
+        key=lambda item: (
+            item["price_lift"] if item["price_lift"] is not None else 0.0,
+            item["price_lift_pct"] if item["price_lift_pct"] is not None else 0.0,
+            item["count"] or 0,
+        ),
+        reverse=True,
+    )
+    dom_levers.sort(
+        key=lambda item: (
+            item["dom_delta"] if item["dom_delta"] is not None else 0.0,
+            -(item["count"] or 0),
+        )
+    )
+    return price_levers, dom_levers
 
 GLOBAL_CSS = """
 <style>
@@ -155,7 +307,410 @@ def load_seasonality_report() -> pd.DataFrame:
     df = pd.read_csv(report_path)
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    df["property_type_norm"] = df["property_type"].apply(normalize_property_type)
+    df["beds"] = pd.to_numeric(df["beds"], errors="coerce")
+    df["baths"] = pd.to_numeric(df["baths"], errors="coerce")
+    df["sqft"] = pd.to_numeric(df["sqft"], errors="coerce")
     return df
+
+
+@st.cache_data
+def load_micro_market_summary() -> pd.DataFrame:
+    summary_path = Path("models/micro_market_summary.csv")
+    if not summary_path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(summary_path)
+    df["property_type"] = df["property_type"].astype(str).str.lower()
+    df["property_type_norm"] = df["property_type"].apply(normalize_property_type)
+    df["beds"] = pd.to_numeric(df["beds"], errors="coerce")
+    df["baths"] = pd.to_numeric(df["baths"], errors="coerce")
+    df["median_dom_days"] = pd.to_numeric(df["median_dom_days"], errors="coerce")
+    df["pct_fast_seller"] = pd.to_numeric(df["pct_fast_seller"], errors="coerce")
+    return df
+
+
+def _find_listing_for_configuration(
+    seasonality_df: pd.DataFrame,
+    *,
+    zip_code: str,
+    beds: Optional[float],
+    baths: Optional[float],
+    sqft_bucket: Optional[str],
+    property_type_norm: Optional[str],
+    subdivision: Optional[str],
+    target_lat: Optional[float] = None,
+    target_lon: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    subset = seasonality_df[
+        seasonality_df["zip_code"].astype(str) == str(zip_code)
+    ].copy()
+    if subset.empty:
+        return None
+    if property_type_norm:
+        pt_subset = subset[subset["property_type_norm"] == property_type_norm]
+        if pt_subset.empty:
+            # Allow fallback when feed uses broader labels (e.g. 'other' for SFR)
+            alias_matches = subset[
+                subset["property_type_norm"].apply(
+                    lambda val: normalize_property_type(val) == property_type_norm
+                    if val is not None
+                    else False
+                )
+            ]
+            if not alias_matches.empty:
+                pt_subset = alias_matches
+        if not pt_subset.empty:
+            subset = pt_subset
+    if subdivision:
+        sub_subset = subset[
+            subset["subdivision"].fillna("").str.lower() == subdivision.lower()
+        ]
+        if not sub_subset.empty:
+            subset = sub_subset
+    if beds is not None and np.isfinite(beds):
+        subset = subset[np.isclose(subset["beds"], beds, atol=0.25)]
+    if baths is not None and np.isfinite(baths):
+        subset = subset[np.isclose(subset["baths"], baths, atol=0.25)]
+    low, high = parse_bucket_range(sqft_bucket)
+    if low is not None and high is not None:
+        subset = subset[(subset["sqft"] >= low) & (subset["sqft"] <= high)]
+    subset = subset.dropna(subset=["sale_price"])
+    if subset.empty:
+        return None
+
+    if target_lat is not None and target_lon is not None:
+        subset["distance"] = np.sqrt(
+            (subset["latitude"] - target_lat) ** 2 + (subset["longitude"] - target_lon) ** 2
+        )
+    else:
+        subset["distance"] = 0.0
+
+    subset = subset.sort_values(
+        ["distance", "sale_price", "fast_seller_probability"],
+        ascending=[True, False, False],
+    )
+    return subset.iloc[0].to_dict()
+
+
+def generate_candidate_recommendations(
+    *,
+    zip_code: str,
+    property_type_label: str,
+    subdivision: Optional[str],
+    triad_cache: Dict[str, Any],
+    target_lat: Optional[float],
+    target_lon: Optional[float],
+    top_k: int = 4,
+) -> List[Dict[str, Any]]:
+    engine = get_recommendation_engine()
+    property_type = PROPERTY_TYPE_SELECT_TO_ENGINE.get(property_type_label, "Single Family Home")
+    lot_features = {
+        "zip_code": zip_code,
+        "latitude": target_lat,
+        "longitude": target_lon,
+        "subdivision": subdivision,
+        "lot_size_acres": 0.25,
+        "lot_condition": "flat",
+        "utilities_status": "all_utilities",
+    }
+
+    engine_recommendations: List[Dict[str, Any]] = []
+    engine_error: Optional[str] = None
+    try:
+        historical_data = load_listings_for_zip(zip_code)
+        if historical_data and subdivision:
+            subdivision_key = subdivision.strip().lower()
+
+            def _listing_subdivision_name(listing: Dict[str, Any]) -> Optional[str]:
+                summary = listing.get("summary") or {}
+                property_detail = listing.get("property_detail_raw") or {}
+                candidates = [
+                    listing.get("subdivision"),
+                    (summary.get("neighborhood") or {}).get("name"),
+                    summary.get("subdivision"),
+                    (property_detail.get("neighborhood") or {}).get("name"),
+                ]
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip().lower()
+                return None
+
+            filtered = [
+                listing
+                for listing in historical_data
+                if _listing_subdivision_name(listing) == subdivision_key
+            ]
+            if filtered:
+                historical_data = filtered
+        engine_payload = engine.generate_recommendations(
+            lot_features=lot_features,
+            property_type=property_type,
+            historical_data=historical_data,
+            top_n=top_k,
+            use_market_insights=False,
+        )
+        engine_context = {
+            "total_evaluated": engine_payload.get("total_evaluated"),
+            "total_passing": engine_payload.get("total_passing_constraints"),
+            "candidate_source": engine_payload.get("candidate_source"),
+            "constraints": engine_payload.get("constraints"),
+            "lot_features": engine_payload.get("lot_features"),
+            "property_type": engine_payload.get("property_type"),
+            "evaluation_errors": engine_payload.get("evaluation_errors"),
+        }
+        for idx, rec in enumerate(engine_payload.get("recommendations", []), start=1):
+            config = rec.get("configuration", {})
+            demand = rec.get("demand", {})
+            margin = rec.get("margin", {})
+
+            listing = {
+                "property_id": f"engine-{zip_code}-{idx}",
+                "zip_code": zip_code,
+                "subdivision": subdivision,
+                "property_type": property_type_label,
+                "beds": config.get("beds"),
+                "baths": config.get("baths"),
+                "sqft": config.get("sqft"),
+                "finish_level": config.get("finish_level"),
+                "sale_price": rec.get("predicted_price"),
+                "fast_seller_probability": demand.get("sell_probability"),
+                "dom_zip_median": demand.get("expected_dom"),
+                "engine_margin_pct": margin.get("gross_margin_pct"),
+                "engine_margin": margin.get("gross_margin"),
+                "engine_price": rec.get("predicted_price"),
+            }
+
+            triad_predictions = {
+                "predicted_price": rec.get("predicted_price"),
+                "sell_probability": demand.get("sell_probability"),
+                "expected_dom": demand.get("expected_dom"),
+                "gross_margin_pct": margin.get("gross_margin_pct"),
+            }
+
+            engine_recommendations.append(
+                {
+                    "listing": listing,
+                    "triad_predictions": triad_predictions,
+                    "engine_recommendation": rec,
+                    "engine_context": engine_context,
+                }
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        engine_error = str(exc)
+        st.warning(f"Builder engine unavailable: {exc}")
+
+    if engine_recommendations:
+        return engine_recommendations
+
+    # Fallback to micro-market analogue approach if engine yields nothing
+    seasonality_df = load_seasonality_report()
+    micro_summary = load_micro_market_summary()
+    if seasonality_df.empty or micro_summary.empty:
+        return []
+
+    property_type_norm = PROPERTY_TYPE_SELECT_TO_NORM.get(property_type_label)
+    ranked = rank_micro_market_configurations(
+        micro_summary,
+        zip_code=zip_code,
+        property_type=property_type_norm,
+        top_k=top_k,
+        min_observed_ratio=0.0,
+    )
+    if ranked.empty:
+        return []
+
+    recommendations: List[Dict[str, Any]] = []
+    for _, row in ranked.iterrows():
+        beds = row.get("beds")
+        baths = row.get("baths")
+        sqft_bucket = row.get("sqft_bucket")
+        listing = _find_listing_for_configuration(
+            seasonality_df,
+            zip_code=zip_code,
+            beds=beds,
+            baths=baths,
+            sqft_bucket=sqft_bucket,
+            property_type_norm=property_type_norm,
+            subdivision=subdivision,
+            target_lat=target_lat,
+            target_lon=target_lon,
+        )
+        if listing is None:
+            continue
+
+        cache_key = "|".join(
+            [
+                str(zip_code),
+                str(listing.get("property_id") or listing.get("propertyId") or listing.get("id") or ""),
+                str(listing.get("latitude") or ""),
+                str(listing.get("longitude") or ""),
+            ]
+        )
+        if cache_key not in triad_cache:
+            triad_cache[cache_key] = compute_tri_model_predictions(zip_code, listing)
+        triad_preds = triad_cache.get(cache_key)
+
+        recommendations.append(
+            {
+                "micro_market": row.to_dict(),
+                "listing": listing,
+                "triad_predictions": triad_preds,
+                "engine_recommendation": None,
+                "engine_error": engine_error,
+                "engine_context": {
+                    "candidate_source": "micro_market",
+                    "engine_error": engine_error,
+                },
+            }
+        )
+
+    return recommendations
+
+
+def generate_engine_recommendations(
+    *,
+    zip_code: str,
+    latitude: Optional[float],
+    longitude: Optional[float],
+    subdivision: Optional[str],
+    property_type_label: str,
+    historical_data: Optional[List[Dict[str, Any]]] = None,
+    top_n: int = 3,
+    use_market_insights: bool = False,
+) -> List[Dict[str, Any]]:
+    engine = get_recommendation_engine()
+    default_lot_acres = 0.25
+    lot_features: Dict[str, Any] = {
+        "zip_code": zip_code,
+        "latitude": latitude,
+        "longitude": longitude,
+        "subdivision": subdivision,
+        "lot_size_acres": default_lot_acres,
+        "lot_size_sqft": default_lot_acres * 43560,
+        "lot_condition": "flat",
+        "utilities_status": "all_utilities",
+    }
+
+    property_type = PROPERTY_TYPE_SELECT_TO_ENGINE.get(property_type_label, "Single Family Home")
+
+    try:
+        result = engine.generate_recommendations(
+            lot_features=lot_features,
+            property_type=property_type,
+            candidate_configs=None,
+            historical_data=historical_data,
+            current_listings_context=None,
+            top_n=top_n,
+            use_market_insights=use_market_insights,
+        )
+        return result.get("recommendations", [])
+    except Exception as exc:
+        st.warning(f"Builder recommendation engine unavailable: {exc}")
+        return []
+
+
+def get_high_end_comparables(
+    *,
+    zip_code: str,
+    property_type_label: str,
+    subdivision: Optional[str],
+    triad_cache: Dict[str, Any],
+    target_lat: Optional[float],
+    target_lon: Optional[float],
+    top_n: int = 3,
+) -> List[Dict[str, Any]]:
+    df = load_seasonality_report()
+    if df.empty:
+        return []
+
+    subset = df[df["zip_code"].astype(str) == str(zip_code)].copy()
+    if subset.empty:
+        return []
+
+    prop_norm = PROPERTY_TYPE_SELECT_TO_NORM.get(property_type_label)
+    if prop_norm and "property_type_norm" in subset.columns:
+        prop_subset = subset[subset["property_type_norm"] == prop_norm]
+        if not prop_subset.empty:
+            subset = prop_subset
+
+    subset = subset.dropna(subset=["sale_price"])
+    if subset.empty:
+        return []
+
+    if subdivision:
+        sub_subset = subset[
+            subset["subdivision"].fillna("").str.lower() == subdivision.lower()
+        ]
+        if not sub_subset.empty:
+            subset = sub_subset
+
+    if target_lat is not None and target_lon is not None:
+        subset["distance"] = np.sqrt(
+            (subset["latitude"] - target_lat) ** 2 + (subset["longitude"] - target_lon) ** 2
+        )
+        subset = subset.sort_values(["distance", "sale_price"], ascending=[True, False])
+    else:
+        subset["distance"] = np.nan
+        subset = subset.sort_values("sale_price", ascending=False)
+
+    subset = subset.head(top_n)
+    if subset.empty:
+        return []
+
+    recommendations: List[Dict[str, Any]] = []
+    for _, row in subset.iterrows():
+        listing = row.to_dict()
+        cache_key = "|".join(
+            [
+                str(zip_code),
+                str(listing.get("property_id") or listing.get("propertyId") or listing.get("id") or ""),
+                str(listing.get("latitude") or ""),
+                str(listing.get("longitude") or ""),
+            ]
+        )
+        if cache_key not in triad_cache:
+            triad_cache[cache_key] = compute_tri_model_predictions(zip_code, listing)
+        triad_preds = triad_cache.get(cache_key)
+        recommendations.append(
+            {
+                "listing": listing,
+                "triad_predictions": triad_preds,
+                "distance": listing.get("distance"),
+            }
+        )
+
+    return recommendations
+
+
+def select_optimal_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Select the candidate that maximises predicted price while controlling DOM."""
+    best_entry: Optional[Dict[str, Any]] = None
+    best_score: float = float("-inf")
+
+    for entry in candidates:
+        listing = entry.get("listing") or {}
+        triad = entry.get("triad_predictions") or {}
+
+        price = safe_float(triad.get("predicted_price")) or safe_float(listing.get("sale_price"))
+        dom = safe_float(triad.get("expected_dom")) or safe_float(
+            listing.get("dom_zip_median") or listing.get("days_from_list_to_pending")
+        )
+        probability = safe_float(triad.get("sell_probability")) or safe_float(
+            listing.get("fast_seller_probability")
+        )
+
+        if price is None or dom is None or dom <= 0:
+            continue
+
+        score = price / max(dom, 1.0)
+        if probability is not None:
+            score *= (0.5 + probability / 2.0)
+
+        if score > best_score:
+            best_score = score
+            best_entry = entry
+
+    return best_entry
 
 
 @st.cache_data
@@ -213,6 +768,16 @@ def get_feature_engineer() -> FeatureEngineer:
     return FeatureEngineer()
 
 
+@st.cache_resource(show_spinner=False)
+def get_recommendation_engine() -> RecommendationEngine:
+    return RecommendationEngine(
+        min_sell_probability=0.45,
+        max_dom=120,
+        min_margin_pct=0.0,
+        sga_allocation=0.10,
+    )
+
+
 @st.cache_data(show_spinner=False, ttl=600)
 def load_listings_for_zip(zip_code: str):
     return fetch_sold_listings_with_features(
@@ -221,6 +786,384 @@ def load_listings_for_zip(zip_code: str):
         max_per_zip=None,
         use_cache=True,
     )
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_listing_lookup(zip_code: str) -> Dict[str, Dict[str, Any]]:
+    listings = load_listings_for_zip(str(zip_code))
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for listing in listings or []:
+        pid = (
+            listing.get("property_id")
+            or (listing.get("summary") or {}).get("propertyId")
+            or (listing.get("summary") or {}).get("id")
+        )
+        if pid is not None:
+            lookup[str(pid)] = listing
+    return lookup
+
+
+def _extract_sale_price(listing: Dict[str, Any]) -> Optional[float]:
+    """Pull the best-available sold price for a listing."""
+    summary = listing.get("summary") or {}
+    candidates = [
+        listing.get("sale_price"),
+        listing.get("price"),
+        summary.get("mlsSoldPrice"),
+        summary.get("lastSaleAmount"),
+        summary.get("mlsListingPrice"),
+        summary.get("listingAmount"),
+        summary.get("price"),
+    ]
+    for candidate in candidates:
+        value = safe_float(candidate)
+        if value is not None and value > 0:
+            return value
+
+    for history in listing.get("priceHistory") or []:
+        event = (history or {}).get("event")
+        price = safe_float((history or {}).get("price"))
+        if event and str(event).lower() == "sold" and price is not None and price > 0:
+            return price
+
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_feature_dataset(zip_code: str) -> pd.DataFrame:
+    listings = load_listings_for_zip(str(zip_code))
+    rows: list[Dict[str, Any]] = []
+    for listing in listings or []:
+        flags = tag_listing_features(listing)
+        summary = listing.get("summary") or {}
+        property_detail = listing.get("property_detail_raw") or {}
+
+        sale_price = _extract_sale_price(listing)
+        dom_pending = listing.get("dom_to_pending")
+        if dom_pending is None:
+            dom_pending = (listing.get("timeline") or {}).get("dom_to_pending")
+
+        beds = safe_float(
+            listing.get("beds")
+            or summary.get("beds")
+            or summary.get("bedrooms")
+            or property_detail.get("beds")
+            or property_detail.get("bedrooms")
+        )
+        baths = safe_float(
+            listing.get("baths")
+            or listing.get("bathrooms")
+            or summary.get("bathstotal")
+            or summary.get("bathsTotal")
+            or property_detail.get("bathstotal")
+        )
+        sqft = safe_float(
+            listing.get("sqft")
+            or listing.get("square_feet")
+            or summary.get("universalsize")
+            or summary.get("squareFeet")
+            or property_detail.get("universalsize")
+            or property_detail.get("squareFeet")
+        )
+        year_built = safe_float(
+            listing.get("year_built")
+            or listing.get("yearBuilt")
+            or summary.get("yearBuilt")
+            or property_detail.get("yearBuilt")
+        )
+        lot_sqft = safe_float(
+            listing.get("lot_sqft")
+            or listing.get("lotSize")
+            or listing.get("lotSizeSquareFeet")
+            or summary.get("lotSize")
+            or summary.get("lotSizeSquareFeet")
+            or property_detail.get("lotSizeSquareFeet")
+        )
+
+        row: Dict[str, Any] = {
+            "sale_price": sale_price,
+            "dom_to_pending": safe_float(dom_pending),
+            "beds": beds,
+            "baths": baths,
+            "sqft": sqft,
+            "year_built": year_built,
+            "lot_sqft": lot_sqft,
+        }
+        if sale_price is not None and sqft:
+            row["price_per_sqft"] = sale_price / sqft if sqft > 0 else None
+        row.update(flags)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_feature_impacts(zip_code: str) -> Dict[str, Dict[str, Any]]:
+    cache_path = Path("data/cache/feature_impacts")
+    cache_path.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_path / f"{zip_code}.json"
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text())
+        except Exception:
+            cache_file.unlink(missing_ok=True)
+
+    df = get_feature_dataset(str(zip_code))
+    if df.empty:
+        _update_feature_coverage(cache_path, str(zip_code), 0, {})
+        return {}
+
+    df["sale_price"] = pd.to_numeric(df["sale_price"], errors="coerce")
+    df = df[df["sale_price"] > 0].copy()
+    if df.empty:
+        _update_feature_coverage(cache_path, str(zip_code), 0, {})
+        cache_file.write_text(json.dumps({}, indent=2, sort_keys=True))
+        return {}
+
+    df["dom_to_pending"] = pd.to_numeric(df["dom_to_pending"], errors="coerce")
+    # Price band segmentation
+    if df["sale_price"].nunique(dropna=True) >= 3:
+        try:
+            df["price_band"] = pd.qcut(
+                df["sale_price"],
+                q=3,
+                labels=["low", "mid", "high"],
+                duplicates="drop",
+            )
+        except Exception:
+            try:
+                df["price_band"] = pd.cut(
+                    df["sale_price"],
+                    bins=3,
+                    labels=["low", "mid", "high"],
+                )
+            except Exception:
+                df["price_band"] = None
+    else:
+        df["price_band"] = None
+
+    impacts: Dict[str, Dict[str, Any]] = {}
+    feature_cols = [key for key in FEATURE_LIBRARY if key in df.columns]
+    control_candidates = ["sqft", "beds", "baths", "year_built", "lot_sqft"]
+    control_cols = [
+        col
+        for col in control_candidates
+        if col in df.columns
+        and pd.to_numeric(df[col], errors="coerce").notna().sum() >= FEATURE_IMPACT_MIN_SAMPLES
+    ]
+
+    def _ridge_uplift(
+        data: pd.DataFrame,
+        target_col: str,
+        *,
+        transform: Optional[Callable[[pd.Series], pd.Series]] = None,
+        inverse: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if data.empty:
+            return None
+        cols = [target_col] + control_cols + feature_cols
+        if any(col not in data.columns for col in cols):
+            return None
+
+        model_df = data[cols].copy()
+        model_df[target_col] = pd.to_numeric(model_df[target_col], errors="coerce")
+        model_df = model_df.dropna(subset=[target_col])
+        if model_df.empty:
+            return None
+
+        for col in control_cols:
+            model_df[col] = pd.to_numeric(model_df[col], errors="coerce")
+            median_val = model_df[col].median(skipna=True)
+            model_df[col] = model_df[col].fillna(median_val if pd.notna(median_val) else 0.0)
+        for col in feature_cols:
+            model_df[col] = model_df[col].fillna(0.0)
+
+        X = model_df[control_cols + feature_cols].astype(float)
+        y = model_df[target_col].astype(float)
+
+        if transform is not None:
+            try:
+                y = transform(y)
+            except Exception:
+                return None
+
+        min_rows = max(FEATURE_IMPACT_MIN_SAMPLES * 2, len(control_cols) + 2)
+        if len(model_df) < min_rows:
+            return None
+
+        try:
+            model = RidgeCV(alphas=np.logspace(-3, 3, 25))
+            model.fit(X, y)
+        except Exception:
+            return None
+
+        lifts: Dict[str, float] = {}
+        pct_lifts: Dict[str, float] = {}
+
+        for feature in feature_cols:
+            mask = X[feature] > 0.5
+            sample_count = int(mask.sum())
+            if sample_count < FEATURE_IMPACT_MIN_SAMPLES:
+                continue
+
+            X_on = X.loc[mask]
+            if X_on.empty:
+                continue
+            X_off = X_on.copy()
+            X_off[feature] = 0.0
+
+            preds_on = model.predict(X_on)
+            preds_off = model.predict(X_off)
+
+            if inverse is not None:
+                try:
+                    preds_on = inverse(preds_on)
+                    preds_off = inverse(preds_off)
+                except Exception:
+                    continue
+
+            diff = preds_on - preds_off
+            if not len(diff):
+                continue
+
+            lifts[feature] = float(np.median(diff))
+
+            if inverse is not None and np.all(preds_off > 0):
+                pct_lifts[feature] = float(np.median(diff / preds_off) * 100.0)
+
+        if not lifts:
+            return None
+
+        return {"lifts": lifts, "pct_lifts": pct_lifts}
+
+    use_model = (
+        RidgeCV is not None
+        and bool(feature_cols)
+        and bool(control_cols)
+        and len(df) >= max(FEATURE_IMPACT_MIN_SAMPLES * 2, len(control_cols) + 2)
+    )
+
+    if use_model:
+        df_model = df[["sale_price", "dom_to_pending"] + control_cols + feature_cols].copy()
+        df_model["price_band"] = df.get("price_band")
+
+        price_results = _ridge_uplift(
+            df_model,
+            "sale_price",
+            transform=np.log,
+            inverse=np.exp,
+        )
+        dom_results = None
+        dom_subset = df_model.dropna(subset=["dom_to_pending"])
+        if not dom_subset.empty:
+            dom_results = _ridge_uplift(dom_subset, "dom_to_pending")
+
+        band_price_results: Dict[str, Dict[str, Any]] = {}
+        band_dom_results: Dict[str, Dict[str, Any]] = {}
+        if "price_band" in df_model.columns:
+            for band in sorted(df_model["price_band"].dropna().unique()):
+                band_mask = df_model["price_band"] == band
+                if band_mask.sum() < max(FEATURE_IMPACT_MIN_SAMPLES * 2, len(control_cols) + 2):
+                    continue
+                band_data = df_model.loc[band_mask]
+                price_band_result = _ridge_uplift(
+                    band_data,
+                    "sale_price",
+                    transform=np.log,
+                    inverse=np.exp,
+                )
+                if price_band_result:
+                    band_price_results[str(band)] = price_band_result
+
+                dom_band_subset = band_data.dropna(subset=["dom_to_pending"])
+                if not dom_band_subset.empty:
+                    dom_band_result = _ridge_uplift(dom_band_subset, "dom_to_pending")
+                    if dom_band_result:
+                        band_dom_results[str(band)] = dom_band_result
+    else:
+        price_results = dom_results = None
+        band_price_results = {}
+        band_dom_results = {}
+
+    base_price = float(df["sale_price"].median(skipna=True)) if not df["sale_price"].dropna().empty else None
+    base_dom = float(df["dom_to_pending"].median(skipna=True)) if not df["dom_to_pending"].dropna().empty else None
+
+    for feature_key, meta in FEATURE_LIBRARY.items():
+        if feature_key not in df.columns:
+            continue
+        feature_df = df[df[feature_key] == 1]
+        sample_count = int(feature_df.shape[0])
+        if sample_count < FEATURE_IMPACT_MIN_SAMPLES:
+            continue
+
+        fallback_price_lift = None
+        fallback_dom_delta = None
+        feature_price = feature_df["sale_price"].median(skipna=True)
+        feature_dom = feature_df["dom_to_pending"].median(skipna=True)
+        if base_price is not None and pd.notna(feature_price):
+            fallback_price_lift = float(feature_price - base_price)
+        if base_dom is not None and pd.notna(feature_dom):
+            fallback_dom_delta = float(feature_dom - base_dom)
+
+        price_lift = fallback_price_lift
+        price_lift_pct = None
+        dom_delta = fallback_dom_delta
+        price_method = "median_delta"
+        dom_method = "median_delta"
+
+        if price_results:
+            lifts = price_results.get("lifts", {})
+            pct_lifts = price_results.get("pct_lifts", {})
+            if lifts and feature_key in lifts:
+                price_lift = lifts[feature_key]
+                price_lift_pct = pct_lifts.get(feature_key)
+                price_method = "ridge_regression"
+
+        if dom_results:
+            dom_lifts = dom_results.get("lifts", {})
+            if dom_lifts and feature_key in dom_lifts:
+                dom_delta = dom_lifts[feature_key]
+                dom_method = "ridge_regression"
+
+        entry: Dict[str, Any] = {
+            "label": meta.get("label", feature_key.replace("_", " ").title()),
+            "count": sample_count,
+            "price_lift": price_lift,
+            "price_lift_pct": price_lift_pct,
+            "dom_delta": dom_delta,
+            "price_method": price_method,
+            "dom_method": dom_method,
+        }
+
+        if band_price_results:
+            band_lifts = {}
+            for band_key, result in band_price_results.items():
+                lifts = result.get("lifts") if result else None
+                if lifts and feature_key in lifts:
+                    band_lifts[band_key] = lifts[feature_key]
+            if band_lifts:
+                entry["price_lift_bands"] = band_lifts
+
+        if band_dom_results:
+            band_dom = {}
+            for band_key, result in band_dom_results.items():
+                lifts = result.get("lifts") if result else None
+                if lifts and feature_key in lifts:
+                    band_dom[band_key] = lifts[feature_key]
+            if band_dom:
+                entry["dom_delta_bands"] = band_dom
+
+        impacts[feature_key] = entry
+
+    if impacts:
+        cache_file.write_text(json.dumps(impacts, indent=2, sort_keys=True))
+    else:
+        cache_file.write_text(json.dumps({}, indent=2, sort_keys=True))
+
+    _update_feature_coverage(cache_path, str(zip_code), int(df.shape[0]), impacts)
+    return impacts
 
 
 def _extract_listing_coords(listing: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
@@ -1425,17 +2368,21 @@ def show_ml_recommendations():
         st.session_state["preview_lat"] = defaults["lat"]
         st.session_state["preview_lon"] = defaults["lon"]
         st.session_state["preview_subdivision"] = defaults["subdivision"]
+    st.session_state.setdefault("preview_zip", defaults["zip"])
+    st.session_state.setdefault("preview_lat", defaults["lat"])
+    st.session_state.setdefault("preview_lon", defaults["lon"])
+    st.session_state.setdefault("preview_subdivision", defaults["subdivision"])
+    st.session_state.setdefault("preview_property_type", "Any")
     st.session_state["_last_selected_demo"] = selected_demo
 
     with st.sidebar.form("builder_form"):
-        zip_code = st.text_input("ZIP Code", value=st.session_state.get("preview_zip", defaults["zip"]), key="preview_zip")
-        latitude = st.number_input("Latitude", value=st.session_state.get("preview_lat", defaults["lat"]), format="%.6f", key="preview_lat")
-        longitude = st.number_input("Longitude", value=st.session_state.get("preview_lon", defaults["lon"]), format="%.6f", key="preview_lon")
-        subdivision = st.text_input("Subdivision (optional)", value=st.session_state.get("preview_subdivision", defaults["subdivision"]), key="preview_subdivision")
+        zip_code = st.text_input("ZIP Code", key="preview_zip")
+        latitude = st.number_input("Latitude", format="%.6f", key="preview_lat")
+        longitude = st.number_input("Longitude", format="%.6f", key="preview_lon")
+        subdivision = st.text_input("Subdivision (optional)", key="preview_subdivision")
         property_type = st.selectbox(
             "Property Type",
             ["Any", "Single Family", "Townhome", "Condo"],
-            index=0,
             key="preview_property_type",
         )
         generate_clicked = st.form_submit_button("Generate builder recommendation", type="primary")
@@ -1449,9 +2396,9 @@ def show_ml_recommendations():
             return df
 
         candidates = df[df["zip_code"].astype(str) == str(zip_code_val)].copy()
-        if prop_type_val != "Any" and "property_type" in candidates.columns:
-            key = prop_type_val.split()[0][:3].upper()
-            candidates = candidates[candidates["property_type"].fillna("").str.upper().str.contains(key)]
+        prop_norm = PROPERTY_TYPE_SELECT_TO_NORM.get(prop_type_val)
+        if prop_norm and "property_type_norm" in candidates.columns:
+            candidates = candidates[candidates["property_type_norm"] == prop_norm]
         if subdivision_val:
             subset = candidates[candidates["subdivision"].fillna("").str.lower() == subdivision_val.lower()]
             if not subset.empty:
@@ -1477,132 +2424,215 @@ def show_ml_recommendations():
             st.session_state.triad_model_cache = {}
             st.toast(f"Loaded {len(matches)} nearby baseline comps.")
 
-    matches_state = st.session_state.get("preview_matches", [])
-    if not matches_state:
-        st.info("Use the controls in the sidebar to load a recommendation.")
-        return
-
-    primary = matches_state[0]
-    alts = matches_state[1:]
-
-    spec_title = (
-        f"{int(primary.get('beds', 0))} BR / {primary.get('baths', 0)} BA · "
-        f"{int(primary.get('sqft', 0) or 0):,} sqft"
-    )
-
     zip_code_clean = str(zip_code).strip()
     triad_cache = st.session_state.setdefault("triad_model_cache", {})
-    cache_key = "|".join(
-        [
-            zip_code_clean,
-            str(primary.get("property_id") or primary.get("propertyId") or primary.get("id") or ""),
-            str(primary.get("latitude") or ""),
-            str(primary.get("longitude") or ""),
-        ]
+
+    recommended_specs = generate_candidate_recommendations(
+        zip_code=zip_code_clean,
+        property_type_label=property_type,
+        subdivision=subdivision or None,
+        triad_cache=triad_cache,
+        target_lat=safe_float(latitude),
+        target_lon=safe_float(longitude),
+        top_k=4,
     )
-    if cache_key not in triad_cache:
-        with st.spinner("Scoring with Triad models..."):
-            triad_cache[cache_key] = compute_tri_model_predictions(zip_code_clean, primary)
-    model_preds = triad_cache.get(cache_key)
-
-    observed_prob = float(primary.get("fast_seller_probability", 0.0) or 0.0)
-    observed_dom = float(primary.get("dom_zip_median", primary.get("days_from_list_to_pending", 0)) or 0.0)
-    observed_price = primary.get("sale_price") or primary.get("price")
-    if isinstance(observed_price, str):
-        cleaned = observed_price.strip().replace(",", "").replace("$", "")
-        try:
-            observed_price = float(cleaned)
-        except ValueError:
-            observed_price = None
-
-    inv_ratio = safe_float(primary.get("zip_inventory_trend_ratio"))
-    triad_prob = observed_prob
-    triad_dom = observed_dom
-    predicted_price = observed_price
-    price_interval = None
-    fast_source = "seasonality"
-    dom_source = "seasonality"
-    price_source = "seasonality"
-    if model_preds:
-        sp = model_preds.get("sell_probability")
-        dom_pred = model_preds.get("expected_dom")
-        price_pred = model_preds.get("predicted_price")
-        if sp is not None:
-            triad_prob = sp
-            fast_source = "triad_model"
-        if dom_pred is not None:
-            triad_dom = dom_pred
-            dom_source = "triad_model"
-        if price_pred is not None:
-            predicted_price = price_pred
-            price_source = "triad_model"
-        lower = model_preds.get("price_lower")
-        upper = model_preds.get("price_upper")
-        if lower is not None and upper is not None:
-            price_interval = (lower, upper)
 
     st.markdown(f'<span class="subheader-pill">🎯 {selected_demo}</span>', unsafe_allow_html=True)
 
-    summary_tab, baseline_tab, alternatives_tab, raw_tab = st.tabs(["Summary", "Seasonality Baseline", "Alternatives", "Raw Data"])
+    engine_picks = [entry for entry in recommended_specs if entry.get("engine_recommendation")]
+    if not engine_picks:
+        st.error(
+            "The builder engine couldn't generate a Triad-backed spec for this selection yet. "
+            "Try a nearby ZIP or refresh after the latest training run completes."
+        )
+        return
 
-    predicted_price_clean = None
-    observed_price_clean = None
-    if predicted_price is not None:
-        pred_val = safe_float(predicted_price)
-        if pred_val is not None:
-            predicted_price_clean = round(pred_val)
-    if observed_price is not None:
-        obs_val = safe_float(observed_price)
-        if obs_val is not None:
-            observed_price_clean = round(obs_val)
+    primary_context = engine_picks[0]
+    alt_contexts = engine_picks[1:]
+
+    engine_payload = primary_context.get("engine_recommendation") or {}
+    triad_predictions = primary_context.get("triad_predictions") or {}
+    listing_stub = primary_context.get("listing") or {}
+    engine_context = primary_context.get("engine_context") or {}
+
+    def _to_int(value: Any) -> Optional[int]:
+        val = safe_float(value)
+        if val is None:
+            return None
+        return int(round(val))
+
+    def _format_baths(value: Any) -> str:
+        if value is None:
+            return "?"
+        if isinstance(value, (int, float)):
+            if float(value).is_integer():
+                return str(int(value))
+            return f"{value:.1f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    config = engine_payload.get("configuration") or {}
+    config_beds = config.get("beds", listing_stub.get("beds"))
+    config_baths = config.get("baths", listing_stub.get("baths"))
+    config_sqft = config.get("sqft", listing_stub.get("sqft"))
+    config_finish = config.get("finish_level") or listing_stub.get("finish_level") or "standard"
+
+    bed_int = _to_int(config_beds)
+    bath_label = _format_baths(config_baths)
+    sqft_int = _to_int(config_sqft)
+    sqft_label = f"{sqft_int:,}" if sqft_int is not None else "?"
+    bed_label = str(bed_int) if bed_int is not None else "?"
+
+    spec_title = f"{bed_label} BR / {bath_label} BA · {sqft_label} sqft"
+
+    demand_block = engine_payload.get("demand") or {}
+    margin_block = engine_payload.get("margin") or {}
+    pricing_details = engine_payload.get("pricing_details") or {}
+
+    predicted_price = safe_float(engine_payload.get("predicted_price"))
+    triad_prob = safe_float(demand_block.get("sell_probability"))
+    triad_dom = safe_float(demand_block.get("expected_dom"))
+    price_lower = safe_float(triad_predictions.get("price_lower"))
+    price_upper = safe_float(triad_predictions.get("price_upper"))
+
+    if predicted_price is None:
+        predicted_price = safe_float(triad_predictions.get("predicted_price"))
+    if triad_prob is None:
+        triad_prob = safe_float(triad_predictions.get("sell_probability"))
+    if triad_dom is None:
+        triad_dom = safe_float(triad_predictions.get("expected_dom"))
+
+    price_interval = None
+    if price_lower is not None and price_upper is not None:
+        price_interval = (price_lower, price_upper)
+
+    margin_pct = safe_float(margin_block.get("gross_margin_pct"))
+    margin_dollars = safe_float(margin_block.get("gross_margin"))
+    risk_score = safe_float(engine_payload.get("risk_score"))
+    model_price_raw = safe_float(pricing_details.get("model_price"))
+    psf_anchor_raw = safe_float(pricing_details.get("psf_anchor"))
+    anchored_price_raw = safe_float(pricing_details.get("anchored_price"))
+
+    feature_impacts = get_feature_impacts(zip_code_clean)
+
+    def _format_pct(value: Any) -> Optional[str]:
+        val = safe_float(value)
+        if val is None:
+            return None
+        return f"{val * 100:.0f}%"
+
+    source_label_map = {
+        "historical": "Triad sold listings",
+        "generated": "Triad sold listings",
+        "fallback_lattice": "static fallback lattice",
+        "micro_market": "micro-market fallback",
+        "provided": "externally supplied configs",
+    }
+
+    summary_bits: List[str] = []
+    candidate_source = engine_context.get("candidate_source")
+    source_label = source_label_map.get(candidate_source)
+    if not source_label:
+        source_label = "Triad sold listings" if not engine_context.get("engine_error") else "unknown"
+    summary_bits.append(f"Source: {source_label}")
+
+    total_eval = engine_context.get("total_evaluated")
+    total_pass = engine_context.get("total_passing")
+    if isinstance(total_eval, (int, float)):
+        summary_bits.append(f"Configs evaluated: {int(total_eval)}")
+        if isinstance(total_pass, (int, float)):
+            summary_bits.append(f"Met guardrails: {int(total_pass)}")
+
+    constraint_bits: List[str] = []
+    constraints = engine_context.get("constraints") or {}
+    min_prob_label = _format_pct(constraints.get("min_sell_probability"))
+    max_dom_val = safe_float(constraints.get("max_dom"))
+    if min_prob_label:
+        constraint_bits.append(f"min sell prob {min_prob_label}")
+    if max_dom_val is not None:
+        constraint_bits.append(f"max DOM {int(max_dom_val)} days")
+    if constraint_bits:
+        summary_bits.append("Guardrails: " + ", ".join(constraint_bits))
+
+    eval_errors = engine_context.get("evaluation_errors") or []
+    if eval_errors:
+        summary_bits.append(f"Issues: {eval_errors[0]}")
+        if len(eval_errors) > 1:
+            summary_bits.append(f"+{len(eval_errors) - 1} more")
+
+    if summary_bits:
+        st.caption(" · ".join(summary_bits))
+    if model_price_raw or psf_anchor_raw:
+        price_caption_parts: list[str] = []
+        if model_price_raw:
+            price_caption_parts.append(f"Model price: {format_currency(model_price_raw)}")
+        if psf_anchor_raw:
+            price_caption_parts.append(f"High-end anchor: {psf_anchor_raw:,.0f} $/sqft")
+        if anchored_price_raw and anchored_price_raw != model_price_raw:
+            price_caption_parts.append(f"Anchor price: {format_currency(anchored_price_raw)}")
+        if price_caption_parts:
+            st.caption(" | ".join(price_caption_parts))
+
+    if engine_payload and engine_payload.get("passes_constraints") is False:
+        guardrail_reasons: List[str] = []
+        min_prob = safe_float(constraints.get("min_sell_probability"))
+        if triad_prob is not None and min_prob is not None and triad_prob < min_prob:
+            guardrail_reasons.append(
+                f"sell probability { _format_pct(triad_prob) } below { _format_pct(min_prob) }"
+            )
+        max_dom_constraint = safe_float(constraints.get("max_dom"))
+        if triad_dom is not None and max_dom_constraint is not None and triad_dom > max_dom_constraint:
+            guardrail_reasons.append(
+                f"expected DOM {int(round(triad_dom))} days above {int(max_dom_constraint)} day cap"
+            )
+        if not guardrail_reasons:
+            guardrail_reasons.append("Review demand guardrails.")
+        st.warning("Guardrail miss: " + " | ".join(guardrail_reasons))
+
+    price_levers, dom_levers = extract_top_feature_moves(feature_impacts)
+    top_feature_recs = price_levers[:3]
+
+    predicted_price_clean = _to_int(predicted_price)
     price_interval_clean = (
-        (round(price_interval[0]), round(price_interval[1])) if price_interval else None
+        ( _to_int(price_interval[0]), _to_int(price_interval[1]) )
+        if price_interval
+        else None
     )
-    inv_ratio_clean = round(inv_ratio, 2) if inv_ratio is not None else None
 
     narrative_metrics = {
         "lot": {
-            "zip_code": primary.get("zip_code"),
-            "latitude": primary.get("latitude"),
-            "longitude": primary.get("longitude"),
-            "subdivision": primary.get("subdivision"),
+            "zip_code": listing_stub.get("zip_code") or zip_code_clean,
+            "latitude": safe_float(listing_stub.get("latitude")),
+            "longitude": safe_float(listing_stub.get("longitude")),
+            "subdivision": listing_stub.get("subdivision") or (subdivision or None),
         },
         "configuration": {
-            "beds": primary.get("beds"),
-            "baths": primary.get("baths"),
-            "sqft": primary.get("sqft"),
-            "finish_level": primary.get("finish_level", "standard"),
-            "stories": primary.get("stories", 2),
-            "garage_spaces": primary.get("garage_spaces", 2),
+            "beds": bed_int,
+            "baths": bath_label,
+            "sqft": sqft_int,
+            "finish_level": config_finish,
+            "stories": config.get("stories", listing_stub.get("stories", 2)),
+            "garage_spaces": config.get("garage_spaces", listing_stub.get("garage_spaces", 2)),
         },
         "demand": {
             "sell_probability": triad_prob,
-            "sell_probability_source": fast_source,
+            "sell_probability_source": "triad_model",
             "expected_dom": triad_dom,
-            "expected_dom_source": dom_source,
-            "seasonality_fast_probability": observed_prob,
-            "seasonality_dom": observed_dom,
+            "expected_dom_source": "triad_model",
+            "seasonality_fast_probability": None,
+            "seasonality_dom": None,
         },
         "margin": {
-            "gross_margin": 0,
-            "gross_margin_pct": 0,
-            "roi": 0,
+            "gross_margin": margin_dollars,
+            "gross_margin_pct": margin_pct,
+            "roi": None,
         },
         "pricing": {
             "predicted_sale_price": predicted_price_clean,
             "predicted_sale_price_formatted": format_currency(predicted_price) if predicted_price is not None else None,
-            "price_to_zip_median": primary.get("price_to_zip_median"),
-            "price_to_subdivision_median": primary.get("price_to_subdivision_median"),
-            "observed_sale_price": observed_price_clean,
-            "observed_sale_price_formatted": format_currency(observed_price) if observed_price is not None else None,
         },
-        "inventory": {
-            "zip_sales_count_30d": primary.get("zip_sales_count_30d"),
-            "zip_sales_count_90d": primary.get("zip_sales_count_90d"),
-            "zip_inventory_trend_ratio": inv_ratio_clean,
-        },
+        "inventory": {},
     }
-    if price_interval_clean:
+    if price_interval_clean and all(price_interval_clean):
         narrative_metrics["pricing"]["predicted_price_low"] = price_interval_clean[0]
         narrative_metrics["pricing"]["predicted_price_high"] = price_interval_clean[1]
         narrative_metrics["pricing"]["predicted_price_low_formatted"] = format_currency(price_interval_clean[0])
@@ -1610,133 +2640,266 @@ def show_ml_recommendations():
         narrative_metrics["pricing"]["predicted_price_range"] = (
             f"{format_currency(price_interval_clean[0])} to {format_currency(price_interval_clean[1])}"
         )
+    narrative_metrics["features"] = top_feature_recs
 
-    with summary_tab:
-        summary_tab.markdown(f"#### {spec_title}")
-        summary_tab.markdown('<div class="metric-row">', unsafe_allow_html=True)
-        render_metric_card(
-            "Triad sell probability",
-            f"{triad_prob*100:.0f}%",
-            footnote=f"Seasonality baseline {observed_prob*100:.0f}%"
-        )
-        render_metric_card(
-            "Triad expected DOM",
-            f"{triad_dom:.0f} days",
-            footnote=f"Seasonality baseline {observed_dom:.0f} days"
-        )
-        observed = safe_float(primary.get("sale_price") or primary.get("price"))
-        price_display = format_currency(predicted_price) if predicted_price else (
-            format_currency(observed) if observed else "—"
-        )
-        if predicted_price and predicted_price < 1000 and observed:
-            price_display = format_currency(observed)
-        price_footnote = "Triad model" if price_source == "triad_model" else "Seasonality baseline"
-        render_metric_card(
-            "Predicted sale price",
-            price_display,
-            footnote=price_footnote
-        )
-        summary_tab.markdown("</div>", unsafe_allow_html=True)
+    tabs = st.tabs(["Recommendation", "Alternatives", "Feature Boosters", "Raw Data"])
+    recommendation_tab, alternatives_tab, features_tab, raw_tab = tabs
 
-        prob_df = pd.DataFrame({
-            "Scenario": ["Triad model", "Seasonality baseline"],
-            "Probability": [triad_prob * 100, observed_prob * 100],
-        })
-        prob_fig = px.bar(
-            prob_df,
-            x="Scenario",
-            y="Probability",
-            color="Scenario",
-            text="Probability",
-            height=260,
-            title="Sell Probability Comparison (%)"
-        )
-        prob_fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=50, b=10))
-        prob_fig.update_traces(texttemplate="%{y:.0f}%", textposition="outside")
-        summary_tab.plotly_chart(prob_fig, use_container_width=True)
+    with recommendation_tab:
+        recommendation_tab.markdown(f"### {spec_title}")
+        recommendation_tab.caption(f"Finish level: **{config_finish.replace('_', ' ').title()}**")
 
-        dom_df = pd.DataFrame({
-            "Scenario": ["Triad model", "Seasonality baseline"],
-            "DOM": [triad_dom, observed_dom],
-        })
-        dom_fig = px.bar(
-            dom_df,
-            x="Scenario",
-            y="DOM",
-            color="Scenario",
-            text="DOM",
-            height=260,
-            title="Days on Market Comparison"
+        price_help = (
+            f"Range {format_currency(price_interval[0])} – {format_currency(price_interval[1])}"
+            if price_interval
+            else None
         )
-        dom_fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=50, b=10))
-        dom_fig.update_traces(texttemplate="%{y:.0f}", textposition="outside")
-        summary_tab.plotly_chart(dom_fig, use_container_width=True)
+        margin_help = (
+            f"≈ {format_currency(margin_dollars)} gross margin"
+            if margin_dollars is not None
+            else None
+        )
 
-        if inv_ratio is not None:
-            inv_fig = go.Figure(
-                go.Indicator(
-                    mode="gauge+number",
-                    value=inv_ratio,
-                    number={"valueformat": ".2f"},
-                    gauge={
-                        "axis": {"range": [0, max(1.5, inv_ratio * 1.2)], "tickwidth": 1},
-                        "bar": {"color": "#38bdf8"},
-                        "steps": [
-                            {"range": [0, 0.9], "color": "#1e293b"},
-                            {"range": [0.9, 1.1], "color": "#0f172a"},
-                            {"range": [1.1, max(1.5, inv_ratio * 1.2)], "color": "#172554"},
-                        ],
-                    },
-                    title={"text": "Inventory Trend Ratio (30d / 90d)"}
+        col1, col2, col3, col4 = recommendation_tab.columns(4)
+        col1.metric(
+            "Predicted price",
+            format_currency(predicted_price) if predicted_price is not None else "—",
+            help=price_help,
+        )
+        col2.metric(
+            "Sell probability",
+            f"{triad_prob * 100:.0f}%" if triad_prob is not None else "—",
+        )
+        col3.metric(
+            "Expected DOM",
+            f"{triad_dom:.0f} days" if triad_dom is not None else "—",
+        )
+        col4.metric(
+            "Gross margin %",
+            f"{margin_pct:.1f}%" if margin_pct is not None else "—",
+            help=margin_help,
+        )
+        if risk_score is not None:
+            recommendation_tab.caption(f"Risk score (lower is better): **{risk_score:.2f}**")
+
+        if price_levers:
+            recommendation_tab.markdown("#### Top price levers")
+            for item in price_levers[:3]:
+                lift = item.get("price_lift")
+                pct = item.get("price_lift_pct")
+                parts = []
+                if lift is not None:
+                    parts.append(f"+{format_currency(lift)}")
+                if pct is not None:
+                    parts.append(f"({pct:+.1f}%)")
+                summary = " ".join(parts) if parts else "—"
+                band_hint = ""
+                bands = item.get("price_lift_bands") or {}
+                if bands:
+                    best_band = max(bands.items(), key=lambda kv: safe_float(kv[1]) or float("-inf"))
+                    if safe_float(best_band[1]) is not None:
+                        band_hint = f" · best in {best_band[0]}: {format_currency(best_band[1])}"
+                method = item.get("price_method") or "unknown"
+                sample_text = f" (n={item['count']})" if item.get("count") else ""
+                recommendation_tab.markdown(
+                    f"- **{item['label']}** · {summary}{band_hint} · method: {method}{sample_text}"
                 )
-            )
-            inv_fig.update_layout(height=260, margin=dict(l=35, r=35, t=60, b=0))
-            summary_tab.plotly_chart(inv_fig, use_container_width=True)
+        elif feature_impacts:
+            recommendation_tab.info("Feature impact stats are loading; rerun shortly for prioritized options.")
 
-        summary_tab.markdown("##### Narrative")
-        summary_tab.info(generate_recommendation_narrative(narrative_metrics))
+        if dom_levers:
+            recommendation_tab.markdown("#### Top DOM levers")
+            for item in dom_levers[:3]:
+                dom_delta = item.get("dom_delta")
+                dom_text = f"{dom_delta:+.1f} days" if dom_delta is not None else "—"
+                band_hint = ""
+                bands = item.get("dom_delta_bands") or {}
+                if bands:
+                    best_band = min(bands.items(), key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("inf"))
+                    if safe_float(best_band[1]) is not None:
+                        band_hint = f" · strongest in {best_band[0]}: {best_band[1]:+.1f} days"
+                method = item.get("dom_method") or "unknown"
+                sample_text = f" (n={item['count']})" if item.get("count") else ""
+                recommendation_tab.markdown(
+                    f"- **{item['label']}** · {dom_text}{band_hint} · method: {method}{sample_text}"
+                )
+        elif feature_impacts:
+            recommendation_tab.info("No DOM reductions surfaced yet; expand the dataset or widen the look-back window.")
+        else:
+            recommendation_tab.warning("No feature impact data available yet for this ZIP.")
 
-    with baseline_tab:
-        baseline_tab.markdown("#### Historical Seasonality Snapshot")
-        baseline_tab.markdown('<div class="metric-row">', unsafe_allow_html=True)
-        render_metric_card("Fast-sale odds", f"{observed_prob*100:.0f}%", footnote="Two-year adjusted baseline")
-        render_metric_card("Median DOM", f"{observed_dom:.0f} days", footnote="Two-year adjusted baseline")
-        if observed_price:
-            render_metric_card("Observed sale price", format_currency(observed_price))
-        baseline_tab.markdown("</div>", unsafe_allow_html=True)
-        baseline_tab.markdown(
-            "- Highlights how similar listings performed before the current softening.\n"
-            "- Serves as a sanity check when comparing to the live Triad model."
-        )
+        recommendation_tab.markdown("#### Narrative")
+        recommendation_tab.info(generate_recommendation_narrative(narrative_metrics))
 
     with alternatives_tab:
-        if not alts:
-            alternatives_tab.info("No additional nearby comps found.")
+        alt_rows: List[Dict[str, Any]] = []
+        for rank, context in enumerate(alt_contexts, start=2):
+            alt_payload = context.get("engine_recommendation") or {}
+            alt_config = alt_payload.get("configuration") or {}
+            alt_demand = alt_payload.get("demand") or {}
+            alt_margin = alt_payload.get("margin") or {}
+            alt_rows.append(
+                {
+                    "Rank": rank,
+                    "Beds": _to_int(alt_config.get("beds")),
+                    "Baths": _format_baths(alt_config.get("baths")),
+                    "Sqft": _to_int(alt_config.get("sqft")),
+                    "Predicted price": format_currency(alt_payload.get("predicted_price"))
+                    if alt_payload.get("predicted_price") is not None
+                    else "—",
+                    "Sell probability": f"{safe_float(alt_demand.get('sell_probability')) * 100:.0f}%"
+                    if alt_demand.get("sell_probability") is not None
+                    else "—",
+                    "Expected DOM": f"{safe_float(alt_demand.get('expected_dom')):.0f}"
+                    if alt_demand.get("expected_dom") is not None
+                    else "—",
+                    "Gross margin %": f"{safe_float(alt_margin.get('gross_margin_pct')):.1f}%"
+                    if alt_margin.get("gross_margin_pct") is not None
+                    else "—",
+                }
+            )
+
+        if alt_rows:
+            alt_df = pd.DataFrame(alt_rows)
+            alternatives_tab.dataframe(alt_df, use_container_width=True, hide_index=True)
         else:
-            alternatives_tab.markdown("#### Nearby Alternatives")
-            alternatives_tab.markdown('<div class="card-grid">', unsafe_allow_html=True)
-            for row in alts:
-                alt_price = row.get("sale_price") or row.get("price")
-                if isinstance(alt_price, str):
-                    try:
-                        alt_price = float(alt_price.replace(",", "").replace("$", ""))
-                    except ValueError:
-                        alt_price = None
-                alternatives_tab.markdown(
-                    f"""
-                    <div class="alt-card">
-                        <div class="alt-card-title">{int(row.get('beds', 0))} BR · {row.get('baths', 0)} BA · {int(row.get('sqft', 0) or 0):,} sqft</div>
-                        <div class="alt-card-metric"><span>Fast-sale odds</span><span>{row.get('fast_seller_probability', 0)*100:.0f}%</span></div>
-                        <div class="alt-card-metric"><span>DOM</span><span>{row.get('dom_zip_median', row.get('days_from_list_to_pending', '?'))}</span></div>
-                        <div class="alt-card-metric"><span>Sale price</span><span>{format_currency(alt_price) if alt_price else '—'}</span></div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+            alternatives_tab.info("No additional builder-engine specs surfaced. Triad models converged on the primary plan.")
+
+    with features_tab:
+        if feature_impacts:
+            if price_levers:
+                features_tab.markdown("##### Price levers (builder-ready)")
+                price_rows: List[Dict[str, Any]] = []
+                for item in price_levers[:6]:
+                    bands = item.get("price_lift_bands") or {}
+                    best_band = ""
+                    if bands:
+                        best_band, best_val = max(
+                            bands.items(),
+                            key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("-inf"),
+                        )
+                        best_val_clean = safe_float(best_val)
+                        if best_val_clean is not None:
+                            best_band = f"{best_band}: {format_currency(best_val_clean)}"
+                    price_rows.append(
+                        {
+                            "Feature": item["label"],
+                            "Median lift $": format_currency(item["price_lift"])
+                            if item.get("price_lift") is not None
+                            else "—",
+                            "Lift %": f"{item['price_lift_pct']:+.1f}%"
+                            if item.get("price_lift_pct") is not None
+                            else "—",
+                            "Sample size": item.get("count") if item.get("count") is not None else "—",
+                            "Best price band": best_band or "—",
+                            "Method": item.get("price_method") or "—",
+                        }
+                    )
+                price_df = pd.DataFrame(price_rows)
+                features_tab.dataframe(price_df, use_container_width=True, hide_index=True)
+            else:
+                features_tab.info("No price levers surfaced; expand the feature dataset to unlock more signals.")
+
+            if dom_levers:
+                features_tab.markdown("##### DOM levers (speed to sell)")
+                dom_rows: List[Dict[str, Any]] = []
+                for item in dom_levers[:6]:
+                    bands = item.get("dom_delta_bands") or {}
+                    best_band = ""
+                    if bands:
+                        best_band, best_val = min(
+                            bands.items(),
+                            key=lambda kv: safe_float(kv[1]) if safe_float(kv[1]) is not None else float("inf"),
+                        )
+                        best_val_clean = safe_float(best_val)
+                        if best_val_clean is not None:
+                            best_band = f"{best_band}: {best_val_clean:+.1f}d"
+                    dom_rows.append(
+                        {
+                            "Feature": item["label"],
+                            "Median DOM delta": f"{item['dom_delta']:+.1f}d"
+                            if item.get("dom_delta") is not None
+                            else "—",
+                            "Sample size": item.get("count") if item.get("count") is not None else "—",
+                            "Best DOM band": best_band or "—",
+                            "Method": item.get("dom_method") or "—",
+                        }
+                    )
+                dom_df = pd.DataFrame(dom_rows)
+                features_tab.dataframe(dom_df, use_container_width=True, hide_index=True)
+            else:
+                features_tab.info("No DOM reductions surfaced yet; widen the lookback window for more comps.")
+
+            def _format_price_bands(bands: Optional[Dict[str, Any]]) -> str:
+                if not bands:
+                    return ""
+                parts = []
+                for band, val in sorted(bands.items()):
+                    if val is None:
+                        continue
+                    parts.append(f"{band}: {format_currency(val)}")
+                return "; ".join(parts)
+
+            def _format_dom_bands(bands: Optional[Dict[str, Any]]) -> str:
+                if not bands:
+                    return ""
+                parts = []
+                for band, val in sorted(bands.items()):
+                    if val is None:
+                        continue
+                    parts.append(f"{band}: {val:+.1f}d")
+                return "; ".join(parts)
+
+            rows = []
+            for key, payload in feature_impacts.items():
+                label = payload.get("label", key.replace("_", " ").title())
+                if "pool" in str(label).lower() or "pool" in str(key).lower():
+                    continue
+                rows.append(
+                    {
+                        "Feature": label,
+                        "Sample count": payload.get("count"),
+                        "Price lift": payload.get("price_lift"),
+                        "Price lift %": payload.get("price_lift_pct"),
+                        "Price method": payload.get("price_method"),
+                        "DOM delta": payload.get("dom_delta"),
+                        "DOM method": payload.get("dom_method"),
+                        "Price bands": _format_price_bands(payload.get("price_lift_bands")),
+                        "DOM bands": _format_dom_bands(payload.get("dom_delta_bands")),
+                    }
                 )
-            alternatives_tab.markdown("</div>", unsafe_allow_html=True)
+
+            feature_df = pd.DataFrame(rows)
+            if not feature_df.empty:
+                feature_df.sort_values(
+                    by=["Price lift"],
+                    ascending=False,
+                    inplace=True,
+                    na_position="last",
+                )
+                feature_df["Price lift"] = feature_df["Price lift"].map(
+                    lambda v: format_currency(v) if v is not None else "—"
+                )
+                feature_df["Price lift %"] = feature_df["Price lift %"].map(
+                    lambda v: f"{v:+.1f}%" if v is not None else "—"
+                )
+                feature_df["DOM delta"] = feature_df["DOM delta"].map(
+                    lambda v: f"{v:+.1f}d" if v is not None else "—"
+                )
+                features_tab.dataframe(feature_df, use_container_width=True, hide_index=True)
+            else:
+                features_tab.info("No qualifying features met the sample threshold for this ZIP.")
+        else:
+            features_tab.warning("Feature impact cache is empty for this ZIP. Run the feature impact script or widen the dataset.")
 
     with raw_tab:
-        raw_tab.dataframe(pd.DataFrame(matches_state), use_container_width=True)
+        raw_tab.json(
+            {
+                "primary": primary_context,
+                "alternatives": alt_contexts,
+                "feature_impacts": feature_impacts,
+            }
+        )
 
 
 def show_listing_popularity():
@@ -1960,6 +3123,55 @@ def show_listing_popularity():
     if 'listing_analysis_results' in st.session_state:
         st.markdown("---")
         st.info("💡 Previous analysis results are cached. Fetch new listings to update.")
+
+
+def _update_feature_coverage(
+    cache_path: Path, zip_code: str, total_rows: int, impacts: Dict[str, Dict[str, Any]]
+) -> None:
+    """Persist per-ZIP coverage plus aggregate stats for feature impacts."""
+    coverage_file = cache_path / "coverage.json"
+    default_payload: Dict[str, Any] = {"by_zip": {}, "summary": {}}
+
+    try:
+        coverage = json.loads(coverage_file.read_text())
+        if not isinstance(coverage, dict):
+            coverage = default_payload.copy()
+    except Exception:
+        coverage = default_payload.copy()
+
+    by_zip = coverage.setdefault("by_zip", {})
+    if total_rows <= 0 and not impacts:
+        by_zip.pop(zip_code, None)
+    else:
+        by_zip[zip_code] = {
+            "updated_at": datetime.utcnow().isoformat(),
+            "listings": int(total_rows),
+            "features": impacts,
+        }
+
+    summary: Dict[str, Dict[str, Any]] = {}
+    for info in by_zip.values():
+        features = info.get("features") or {}
+        seen: Set[str] = set()
+        for feat_key, payload in features.items():
+            entry = summary.setdefault(
+                feat_key,
+                {
+                    "label": payload.get("label")
+                    or FEATURE_LIBRARY.get(feat_key, {}).get("label", feat_key.replace("_", " ").title()),
+                    "zip_count": 0,
+                    "total_count": 0,
+                    "total_listings": 0,
+                },
+            )
+            if feat_key not in seen:
+                entry["zip_count"] += 1
+                seen.add(feat_key)
+            entry["total_count"] += int(payload.get("count") or 0)
+            entry["total_listings"] += int(info.get("listings") or 0)
+
+    coverage["summary"] = summary
+    coverage_file.write_text(json.dumps(coverage, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

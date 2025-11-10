@@ -1,0 +1,223 @@
+{
+  "thresholds_by_zip": {
+    "27101": 40,
+    "27103": 40,
+    "27104": 38,
+    "27105": 40.0,
+    "27106": 40.0,
+    "27107": 40,
+    "27127": 40.0,
+    "27260": 40.0,
+    "27262": 43.0,
+    "27263": 40,
+    "27265": 40,
+    "27401": 48,
+    "27403": 40.0,
+    "27405": 50,
+    "27406": 42.0,
+    "27407": 40,
+    "27408": 35.0,
+    "27409": 40.0,
+    "27410": 42.0,
+    "27455": 40.0
+  },
+  "threshold_method": "median_dom_per_zip",
+  "threshold_description": "Fast sellers = DOM < median DOM for that ZIP (fastest 50%)",
+  "dom_stats_by_zip": {
+    "27101": {
+      "count": 321,
+      "median": 40.0,
+      "p75": 61.0,
+      "p90": 91.0
+    },
+    "27103": {
+      "count": 825,
+      "median": 40.0,
+      "p75": 58.0,
+      "p90": 89.0
+    },
+    "27104": {
+      "count": 635,
+      "median": 38.0,
+      "p75": 54.0,
+      "p90": 82.0
+    },
+    "27105": {
+      "count": 502,
+      "median": 40.0,
+      "p75": 68.0,
+      "p90": 89.0
+    },
+    "27106": {
+      "count": 834,
+      "median": 40.0,
+      "p75": 59.0,
+      "p90": 87.0
+    },
+    "27107": {
+      "count": 731,
+      "median": 40.0,
+      "p75": 68.0,
+      "p90": 90.0
+    },
+    "27127": {
+      "count": 816,
+      "median": 40.0,
+      "p75": 63.0,
+      "p90": 89.0
+    },
+    "27260": {
+      "count": 200,
+      "median": 40.0,
+      "p75": 61.0,
+      "p90": 91.1
+    },
+    "27262": {
+      "count": 246,
+      "median": 43.0,
+      "p75": 68.0,
+      "p90": 95.5
+    },
+    "27263": {
+      "count": 169,
+      "median": 40.0,
+      "p75": 68.0,
+      "p90": 96.0
+    },
+    "27265": {
+      "count": 305,
+      "median": 40.0,
+      "p75": 61.0,
+      "p90": 88.60000000000002
+    },
+    "27401": {
+      "count": 183,
+      "median": 48.0,
+      "p75": 70.5,
+      "p90": 98.40000000000003
+    },
+    "27403": {
+      "count": 254,
+      "median": 40.0,
+      "p75": 68.0,
+      "p90": 89.0
+    },
+    "27405": {
+      "count": 291,
+      "median": 50.0,
+      "p75": 80.5,
+      "p90": 104.0
+    },
+    "27406": {
+      "count": 218,
+      "median": 42.0,
+      "p75": 62.0,
+      "p90": 89.30000000000001
+    },
+    "27407": {
+      "count": 243,
+      "median": 40.0,
+      "p75": 63.0,
+      "p90": 88.60000000000002
+    },
+    "27408": {
+      "count": 304,
+      "median": 35.0,
+      "p75": 54.0,
+      "p90": 75.69999999999999
+    },
+    "27409": {
+      "count": 288,
+      "median": 40.0,
+      "p75": 61.0,
+      "p90": 89.0
+    },
+    "27410": {
+      "count": 354,
+      "median": 42.0,
+      "p75": 67.0,
+      "p90": 89.0
+    },
+    "27455": {
+      "count": 274,
+      "median": 40.0,
+      "p75": 61.0,
+      "p90": 87.70000000000002
+    }
+  },
+  "dom_global_median": 40.0,
+  "dom_global_p75": 62.0,
+  "dom_global_p90": 89.0,
+  "dom_strategy": "regression_metro_only",
+  "dom_bucket_counts": {
+    "31-60": 3252,
+    "60+": 2284,
+    "15-30": 1748,
+    "8-14": 648,
+    "0-7": 61
+  },
+  "dom_regression_scope": "metro_only",
+  "dom_regression_zip_whitelist": [
+    "27101",
+    "27103",
+    "27104",
+    "27105",
+    "27106",
+    "27107",
+    "27127",
+    "27214",
+    "27215",
+    "27217",
+    "27260",
+    "27262",
+    "27263",
+    "27265",
+    "27282",
+    "27284",
+    "27401",
+    "27403",
+    "27405",
+    "27406",
+    "27407",
+    "27408",
+    "27409",
+    "27410",
+    "27455"
+  ],
+  "dom_regression_mask_positive_count": 7993,
+  "dom_regression_mask_positive_ratio": 1.0,
+  "dom_regression_min_dom": 3,
+  "excluded_features": [
+    "days_from_list_to_pending",
+    "days_from_list_to_sale",
+    "prior_sale_gap_days"
+  ],
+  "dom_regression_enabled": true,
+  "dom_regression_cutoff": 120,
+  "dom_regression_total_labeled": 7993,
+  "dom_regression_max_mae": 25.0,
+  "dom_training_samples": 7993,
+  "dom_regression_min_samples": 7500,
+  "dom_regressor_samples": 7193,
+  "dom_log_range": {
+    "min": 1.8562979903656263,
+    "max": 4.74493212836325
+  },
+  "trained_at": "2025-11-08T19:42:23.825089",
+  "feature_count": 75,
+  "classifier_metrics": {
+    "test_auc": 0.7948496587577148,
+    "test_accuracy": 0.72125,
+    "test_precision": 0.6953125,
+    "test_recall": 0.7158176943699732,
+    "test_f1": 0.7054161162483488
+  },
+  "regressor_metrics": {
+    "test_mae": 16.018256012320517,
+    "test_mape": 47.32202067303089,
+    "test_r2": 0.2769065485685941,
+    "test_rmse": 22.801777714761123,
+    "strategy": "xgboost_regressor"
+  },
+  "target_transform": "zip_median_heuristic"
+}

@@ -3,14 +3,19 @@ Recommendation Engine
 Combines pricing, demand, and cost models to generate optimal build recommendations.
 """
 
+import datetime
+import json
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-import pandas as pd
-import numpy as np
+import math
 from itertools import product
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 
-from backend.ml.pricing_model import pricing_model
-from backend.ml.demand_model import demand_model
+import numpy as np
+import pandas as pd
+
+from backend.ml.pricing_model import PricingModel
+from backend.ml.demand_model import DemandModel
 from backend.ml.cost_estimator import cost_estimator, CostBreakdown
 from backend.ml.feature_engineering import feature_engineer
 try:
@@ -60,6 +65,21 @@ class RecommendationEngine:
         self.max_dom = max_dom
         self.min_margin_pct = min_margin_pct
         self.sga_allocation = sga_allocation
+        self._model_dir = Path("models/triad_latest")
+        self._pricing_model_name = "triad_pricing_model"
+        self._demand_model_name = "triad_demand_model"
+        self._pricing_model: Optional[PricingModel] = None
+        self._demand_model: Optional[DemandModel] = None
+        self._new_build_cache_path = Path("data/cache/new_build_specs.json")
+        self._new_build_cache: Optional[Dict[str, Any]] = None
+        self._premium_subdivision_keys = {
+            "new irving park",
+            "irving park",
+            "starmount forest",
+            "sedgefield",
+            "summerfield",
+        }
+        self._last_candidate_source: Optional[str] = None
         
     def generate_recommendations(
         self,
@@ -93,136 +113,98 @@ class RecommendationEngine:
         Returns:
             Dictionary with recommendations and metadata
         """
-        logger.info(f"Generating recommendations for lot in {lot_features.get('zip_code', 'unknown ZIP')}")
-        print(f"[DEBUG] Starting recommendation generation for ZIP {lot_features.get('zip_code', 'unknown')}")  # Visible in Streamlit
-        
-        # Check if model files exist - use absolute path relative to project root
-        import os
-        from pathlib import Path
-        
-        # Get the project root (assuming this file is in backend/ml/)
+        logger.info(
+            "Generating recommendations for lot in %s",
+            lot_features.get("zip_code", "unknown ZIP"),
+        )
+        print(  # noqa: T201 - surfaced in Streamlit console
+            f"[DEBUG] Starting recommendation generation for ZIP {lot_features.get('zip_code', 'unknown')}"
+        )
+
         current_file = Path(__file__).resolve()
-        project_root = current_file.parent.parent.parent  # Go up from backend/ml/ to project root
-        model_dir = project_root / "models"
-        pricing_model_path = model_dir / "pricing_model.pkl"
-        demand_model_path = model_dir / "demand_model_probability.pkl"
-        
-        print(f"[DEBUG] Project root: {project_root}")
-        print(f"[DEBUG] Model directory: {model_dir}")
-        print(f"[DEBUG] Current working directory: {os.getcwd()}")
-        
-        pricing_exists = pricing_model_path.exists()
-        demand_exists = demand_model_path.exists()
-        
-        print(f"[DEBUG] Pricing model file exists: {pricing_exists} at {pricing_model_path}")
-        print(f"[DEBUG] Demand model file exists: {demand_exists} at {demand_model_path}")
-        
-        if not pricing_exists or not demand_exists:
-            missing = []
-            if not pricing_exists:
-                missing.append(f"pricing model ({pricing_model_path})")
-            if not demand_exists:
-                missing.append(f"demand model ({demand_model_path})")
-            error_msg = f'Model files not found: {", ".join(missing)}. Please train models first using: python backend/ml/train_models.py'
-            print(f"[DEBUG] ERROR: {error_msg}")
+        project_root = current_file.parent.parent.parent
+        triad_model_dir = project_root / "models" / "triad_latest"
+        self._model_dir = triad_model_dir
+
+        pricing_model_path = triad_model_dir / f"{self._pricing_model_name}.pkl"
+        demand_model_prob_path = triad_model_dir / f"{self._demand_model_name}_probability.pkl"
+        demand_model_dom_path = triad_model_dir / f"{self._demand_model_name}_dom.pkl"
+
+        missing: List[str] = []
+        if not pricing_model_path.exists():
+            missing.append(str(pricing_model_path))
+        if not demand_model_prob_path.exists():
+            missing.append(str(demand_model_prob_path))
+        if not demand_model_dom_path.exists():
+            missing.append(str(demand_model_dom_path))
+
+        if missing:
+            error_msg = (
+                "Triad model artifacts not found. Missing files: " + ", ".join(missing)
+            )
             logger.error(error_msg)
             return {
-                'error': error_msg,
-                'recommendations': [],
-                'total_evaluated': 0
+                "error": error_msg,
+                "recommendations": [],
+                "total_evaluated": 0,
             }
-        
-        # Update model_dir on singleton instances to use Path object (not string)
-        pricing_model.model_dir = model_dir
-        demand_model.model_dir = model_dir
-        
-        # Try to load models if they exist but aren't loaded
-        try:
-            if pricing_model.model is None:
-                try:
-                    print("[DEBUG] Loading pricing model...")
-                    pricing_model.load()
-                    logger.info("Loaded pricing model from disk")
-                    print("[DEBUG] Pricing model loaded successfully")
-                except Exception as e:
-                    error_msg = f"Could not load pricing model: {e}"
-                    logger.error(error_msg)
-                    print(f"[DEBUG] ERROR: {error_msg}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    return {
-                        'error': f'Failed to load pricing model: {str(e)}. Please check model file.',
-                        'recommendations': [],
-                        'total_evaluated': 0
-                    }
-            
-            if demand_model.sell_probability_model is None or demand_model.dom_model is None:
-                try:
-                    print("[DEBUG] Loading demand model...")
-                    demand_model.load()
-                    logger.info("Loaded demand model from disk")
-                    print("[DEBUG] Demand model loaded successfully")
-                except Exception as e:
-                    error_msg = f"Could not load demand model: {e}"
-                    logger.error(error_msg)
-                    print(f"[DEBUG] ERROR: {error_msg}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    return {
-                        'error': f'Failed to load demand model: {str(e)}. Please check model file.',
-                        'recommendations': [],
-                        'total_evaluated': 0
-                    }
-            
-            # Load fast-seller model if using market insights
-            if use_market_insights and FAST_SELLER_AVAILABLE:
-                try:
-                    print("[DEBUG] Loading fast-seller model...")
-                    fast_seller_model.load()
-                    logger.info("Fast-seller model loaded successfully")
-                    print("[DEBUG] Fast-seller model loaded successfully")
-                except Exception as e:
-                    logger.warning(f"Fast-seller model not available: {e}. Continuing without market insights.")
-                    print(f"[DEBUG] Warning: Fast-seller model not available: {e}")
-                    use_market_insights = False
-        except Exception as e:
-            error_msg = f"Error loading models: {e}"
-            logger.error(error_msg)
-            print(f"[DEBUG] ERROR: {error_msg}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {
-                'error': f'Error loading models: {str(e)}',
-                'recommendations': [],
-                'total_evaluated': 0
-            }
-        
-        # Check if models are loaded
-        if pricing_model.model is None:
-            error_msg = 'Pricing model not loaded. Model file exists but failed to load.'
-            print(f"[DEBUG] ERROR: {error_msg}")
-            logger.error(error_msg)
-            return {
-                'error': error_msg,
-                'recommendations': [],
-                'total_evaluated': 0
-            }
-        
-        if demand_model.sell_probability_model is None or demand_model.dom_model is None:
-            error_msg = 'Demand model not loaded. Model file exists but failed to load.'
-            print(f"[DEBUG] ERROR: {error_msg}")
-            logger.error(error_msg)
-            return {
-                'error': error_msg,
-                'recommendations': [],
-                'total_evaluated': 0
-            }
-        
-        print("[DEBUG] Models loaded successfully, generating candidate configurations...")
+
+        # Lazily load Triad pricing/demand models
+        if self._pricing_model is None:
+            try:
+                self._pricing_model = PricingModel(model_dir=str(triad_model_dir))
+                self._pricing_model.load(model_name=self._pricing_model_name)
+                logger.info("Loaded Triad pricing model from %s", triad_model_dir)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                error_msg = f"Could not load Triad pricing model: {exc}"
+                logger.error(error_msg)
+                return {
+                    "error": error_msg,
+                    "recommendations": [],
+                    "total_evaluated": 0,
+                }
+
+        if self._demand_model is None:
+            try:
+                self._demand_model = DemandModel(model_dir=str(triad_model_dir))
+                self._demand_model.load(model_name=self._demand_model_name)
+                logger.info("Loaded Triad demand model from %s", triad_model_dir)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                error_msg = f"Could not load Triad demand model: {exc}"
+                logger.error(error_msg)
+                return {
+                    "error": error_msg,
+                    "recommendations": [],
+                    "total_evaluated": 0,
+                }
+
+        # Load fast-seller model if available in Triad directory
+        if use_market_insights and FAST_SELLER_AVAILABLE:
+            try:
+                fast_seller_model.model_dir = triad_model_dir
+                fast_seller_model.load()
+                logger.info("Fast-seller model loaded from %s", triad_model_dir)
+            except Exception as exc:
+                logger.warning(
+                    "Fast-seller model unavailable in Triad directory (%s); "
+                    "continuing without market insights.",
+                    exc,
+                )
+                use_market_insights = False
+
+        print("[DEBUG] Models loaded successfully, generating candidate configurations...")  # noqa: T201
         
         # Generate candidate configurations if not provided
+        candidate_source = "provided" if candidate_configs is not None else None
         if candidate_configs is None:
-            candidate_configs = self._generate_candidate_configs(property_type, lot_features)
+            candidate_configs = self._generate_candidate_configs(
+                property_type,
+                lot_features,
+                historical_data=historical_data,
+            )
+            candidate_source = self._last_candidate_source or "generated"
+        else:
+            self._last_candidate_source = "provided"
         
         logger.info(f"Evaluating {len(candidate_configs)} candidate configurations")
         
@@ -268,21 +250,60 @@ class RecommendationEngine:
                 'successful_evaluations': 0
             }
         
-        # Filter by constraints
-        filtered_results = self._apply_constraints(results)
-        
         # Sort by combined score (margin + fast-seller probability if available)
         def get_combined_score(rec):
-            margin_score = rec['margin']['gross_margin']
-            # Add fast-seller boost if available (0-30% of margin)
-            if 'fast_seller_probability' in rec.get('demand', {}):
-                fast_prob = rec['demand']['fast_seller_probability']
-                # Boost margin by up to 30% based on fast-seller probability
-                fast_boost = margin_score * 0.3 * fast_prob
-                return margin_score + fast_boost
-            return margin_score
-        
-        filtered_results.sort(key=get_combined_score, reverse=True)
+            margin_score = float(rec.get('margin', {}).get('gross_margin', 0.0) or 0.0)
+            demand_block = rec.get('demand', {}) or {}
+            sell_prob = demand_block.get('sell_probability')
+            fast_prob = demand_block.get('fast_seller_probability')
+            expected_dom = demand_block.get('expected_dom')
+            config_sqft = self._coerce_float(rec.get('configuration', {}).get('sqft'))
+            predicted_price = self._coerce_float(rec.get('predicted_price'))
+
+            score = margin_score
+
+            primary_prob = None
+            if sell_prob is not None:
+                primary_prob = float(sell_prob)
+            elif fast_prob is not None:
+                primary_prob = float(fast_prob)
+
+            if primary_prob is not None:
+                clipped_prob = min(max(primary_prob, 0.0), 1.0)
+                score *= 0.5 + clipped_prob  # scale margin by demand velocity
+
+            if expected_dom is not None:
+                dom_value = float(expected_dom)
+                score -= dom_value * 1000.0  # penalise slower absorption
+
+            if predicted_price is not None:
+                score += float(predicted_price) * 0.05
+
+            if sqft_target is not None and config_sqft is not None and config_sqft < sqft_target:
+                shortfall_ratio = (sqft_target - config_sqft) / max(sqft_target, 1.0)
+                if shortfall_ratio > 0:
+                    score -= shortfall_ratio * margin_score * 0.6
+
+            return score
+
+        sqft_target = None
+        if historical_data:
+            sqft_values: List[float] = []
+            for listing in historical_data:
+                sqft_val = self._coerce_float(
+                    listing.get("sqft")
+                    or listing.get("square_feet")
+                    or (listing.get("summary") or {}).get("universalsize")
+                    or (listing.get("summary") or {}).get("squareFeet")
+                )
+                if sqft_val is not None:
+                    sqft_values.append(float(sqft_val))
+            if sqft_values:
+                percentile_value = 85 if len(sqft_values) >= 20 else 75
+                sqft_target = float(np.percentile(sqft_values, percentile_value))
+
+        filtered_results = sorted(results, key=get_combined_score, reverse=True)
+        passing_count = sum(1 for rec in results if rec.get('passes_constraints'))
         
         # Get top N
         top_recommendations = filtered_results[:top_n]
@@ -324,46 +345,282 @@ class RecommendationEngine:
         return {
             'recommendations': top_recommendations,
             'total_evaluated': len(results),
-            'total_passing_constraints': len(filtered_results),
+            'total_passing_constraints': passing_count,
             'constraints': {
                 'min_sell_probability': self.min_sell_probability,
                 'max_dom': self.max_dom,
                 'min_margin_pct': self.min_margin_pct
             },
             'lot_features': lot_features,
-            'property_type': property_type
+            'property_type': property_type,
+            'candidate_source': candidate_source,
+            'evaluation_errors': evaluation_errors,
         }
     
     def _generate_candidate_configs(
         self,
         property_type: str,
-        lot_features: Dict[str, Any]
+        lot_features: Dict[str, Any],
+        *,
+        historical_data: Optional[List[Dict[str, Any]]] = None,
+        max_configs: int = 60,
     ) -> List[Dict[str, Any]]:
         """
         Generate candidate house configurations to evaluate.
-        
-        Args:
-            property_type: Property type
-            lot_features: Lot features (may inform size constraints)
-            
-        Returns:
-            List of configuration dictionaries
+
+        Preference order:
+        1. Use historical sold listings (Triad data) to derive real-world combos.
+        2. Fall back to a static lattice when insufficient data is available.
         """
-        configs = []
-        
-        # Define ranges based on property type
-        if property_type == 'Single Family Home':
+        data_configs = self._generate_configs_from_historical(
+            property_type=property_type,
+            lot_features=lot_features,
+            historical_data=historical_data,
+            max_configs=max_configs,
+        )
+        if data_configs:
+            self._last_candidate_source = "historical"
+            logger.info(
+                "Generated %s data-driven candidate configurations for %s",
+                len(data_configs),
+                property_type,
+            )
+            return data_configs
+
+        fallback_configs = self._generate_fallback_configs(
+            property_type=property_type,
+            lot_features=lot_features,
+            max_configs=max_configs,
+        )
+        self._last_candidate_source = "fallback_lattice"
+        logger.info(
+            "Historical combos unavailable; using fallback lattice (%s configs)",
+            len(fallback_configs),
+        )
+        return fallback_configs
+
+    def _generate_configs_from_historical(
+        self,
+        *,
+        property_type: str,
+        lot_features: Dict[str, Any],
+        historical_data: Optional[List[Dict[str, Any]]],
+        max_configs: int,
+    ) -> List[Dict[str, Any]]:
+        subdivision_key: Optional[str] = None
+        raw_subdivision = lot_features.get("subdivision")
+        if raw_subdivision:
+            subdivision_key = str(raw_subdivision).strip().lower()
+
+        new_build_rows: List[Dict[str, Any]] = []
+        legacy_rows: List[Dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = []
+
+        if historical_data:
+            for listing in historical_data:
+                label_text = self._extract_property_labels(listing)
+                if not self._property_type_matches(property_type, label_text):
+                    continue
+
+                if subdivision_key:
+                    listing_subdivision = (
+                        listing.get("subdivision")
+                        or (listing.get("summary") or {}).get("neighborhood", {}).get("name")
+                        or (listing.get("summary") or {}).get("subdivision")
+                        or (listing.get("property_detail_raw") or {}).get("neighborhood", {}).get("name")
+                    )
+                    if (
+                        not listing_subdivision
+                        or str(listing_subdivision).strip().lower() != subdivision_key
+                    ):
+                        continue
+
+                year_built_value = (
+                    listing.get("year_built")
+                    or listing.get("yearBuilt")
+                    or (listing.get("summary") or {}).get("yearBuilt")
+                    or (listing.get("property_detail_raw") or {}).get("yearBuilt")
+                    or (listing.get("metadata") or {}).get("year_built")
+                )
+                is_new_build = False
+                if year_built_value is not None:
+                    try:
+                        year_numeric = int(float(year_built_value))
+                        if year_numeric >= datetime.datetime.now().year - 3:
+                            is_new_build = True
+                    except Exception:
+                        is_new_build = False
+
+                beds = self._coerce_int(
+                    listing.get("beds")
+                    or (listing.get("summary") or {}).get("beds")
+                    or (listing.get("summary") or {}).get("bedrooms")
+                )
+                baths = self._coerce_float(
+                    listing.get("baths")
+                    or listing.get("bathrooms")
+                    or (listing.get("summary") or {}).get("baths")
+                    or (listing.get("summary") or {}).get("bathstotal")
+                )
+                sqft = self._coerce_int(
+                    listing.get("sqft")
+                    or listing.get("square_feet")
+                    or (listing.get("summary") or {}).get("universalsize")
+                    or (listing.get("summary") or {}).get("squareFeet")
+                )
+
+                if beds is None or baths is None or sqft is None:
+                    continue
+                if beds <= 0 or sqft <= 700:
+                    continue
+                if beds > 7:
+                    continue
+                if baths < 2.0 or baths > beds + 1:
+                    continue
+
+                sqft_per_bed = sqft / max(beds, 1)
+                if sqft_per_bed < 300 or sqft_per_bed > 1750:
+                    continue
+                sqft_per_bath = sqft / max(baths, 1.0)
+                if sqft_per_bath < 400 or sqft_per_bath > 2000:
+                    continue
+
+                record = {
+                    "beds": beds,
+                    "baths": float(baths),
+                    "sqft": sqft,
+                }
+                if is_new_build:
+                    new_build_rows.append(record)
+                else:
+                    legacy_rows.append(record)
+
+        if not (new_build_rows or legacy_rows):
+            region_new_builds = self._load_regional_new_build_configs(property_type)
+            if subdivision_key:
+                subset = [row for row in region_new_builds if row.get("subdivision_key") == subdivision_key]
+                if not subset:
+                    subset = [
+                        row
+                        for row in region_new_builds
+                        if row.get("subdivision_key") in self._premium_subdivision_keys
+                    ]
+                if subset:
+                    new_build_rows.extend(
+                        {"beds": row["beds"], "baths": row["baths"], "sqft": row["sqft"]}
+                        for row in subset
+                    )
+                else:
+                    new_build_rows.extend(
+                        {"beds": row["beds"], "baths": row["baths"], "sqft": row["sqft"]}
+                        for row in region_new_builds
+                    )
+            else:
+                prioritized = [
+                    {"beds": row["beds"], "baths": row["baths"], "sqft": row["sqft"]}
+                    for row in region_new_builds
+                    if row.get("subdivision_key") in self._premium_subdivision_keys
+                ]
+                if prioritized:
+                    new_build_rows.extend(prioritized)
+                else:
+                    new_build_rows.extend(
+                        {"beds": row["beds"], "baths": row["baths"], "sqft": row["sqft"]}
+                        for row in region_new_builds
+                    )
+
+        rows = new_build_rows + legacy_rows
+        if not rows:
+            return []
+
+        df = pd.DataFrame(rows)
+        df = df[(df["beds"] > 0) & (df["sqft"] >= 700)]
+        if df.empty:
+            return []
+
+        df["beds"] = df["beds"].astype(int)
+        df["baths"] = df["baths"].round(1)
+        df["sqft"] = df["sqft"].astype(int)
+
+        grouped = df.groupby(["beds", "baths"])
+
+        candidate_configs: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, float, int, str]] = set()
+
+        summaries: List[Tuple[int, float, pd.Series]] = []
+        for (beds, baths), group in grouped:
+            if group.empty:
+                continue
+            summaries.append((beds, baths, group["sqft"]))
+
+        # Sort by frequency (descending) so dominant combos appear first
+        summaries.sort(key=lambda tup: len(tup[2]), reverse=True)
+
+        for beds, baths, sqft_series in summaries:
+            if len(candidate_configs) >= max_configs:
+                break
+
+            quantiles = sqft_series.quantile([0.25, 0.5, 0.75]).to_dict()
+            sqft_candidates = {
+                self._coerce_int(sqft_series.min()),
+                self._coerce_int(quantiles.get(0.25)),
+                self._coerce_int(quantiles.get(0.5)),
+                self._coerce_int(quantiles.get(0.75)),
+                self._coerce_int(sqft_series.max()),
+            }
+            sqft_candidates = {
+                sqft for sqft in sqft_candidates if sqft is not None and sqft >= 700
+            }
+
+            if not sqft_candidates:
+                continue
+
+            for sqft in sorted(sqft_candidates):
+                for finish in ("standard", "premium"):
+                    key = (beds, float(baths), sqft, finish)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidate_configs.append(
+                        {
+                            "beds": beds,
+                            "baths": float(baths),
+                            "sqft": sqft,
+                            "finish_level": finish,
+                            "property_type": property_type,
+                            "stories": 1 if sqft < 2000 else 2,
+                            "garage_spaces": 2
+                            if property_type == "Single Family Home"
+                            else 1,
+                        }
+                    )
+                    if len(candidate_configs) >= max_configs:
+                        break
+                if len(candidate_configs) >= max_configs:
+                    break
+
+        return candidate_configs
+
+    def _generate_fallback_configs(
+        self,
+        *,
+        property_type: str,
+        lot_features: Dict[str, Any],
+        max_configs: int,
+    ) -> List[Dict[str, Any]]:
+        configs: List[Dict[str, Any]] = []
+
+        if property_type == "Single Family Home":
             bed_range = [3, 4, 5]
             bath_range = [2.0, 2.5, 3.0, 3.5, 4.0]
             sqft_ranges = [
-                (1500, 1800),   # Small
-                (1800, 2200),   # Medium-small
-                (2200, 2600),   # Medium
-                (2600, 3000),   # Medium-large
-                (3000, 3500),   # Large
+                (1500, 1800),
+                (1800, 2200),
+                (2200, 2600),
+                (2600, 3000),
+                (3000, 3600),
             ]
-            finish_levels = ['standard', 'premium']
-        elif property_type == 'Townhome':
+        elif property_type == "Townhome":
             bed_range = [2, 3, 4]
             bath_range = [2.0, 2.5, 3.0]
             sqft_ranges = [
@@ -371,8 +628,7 @@ class RecommendationEngine:
                 (1600, 2000),
                 (2000, 2400),
             ]
-            finish_levels = ['standard', 'premium']
-        else:  # Condo
+        else:  # Condo or other
             bed_range = [1, 2, 3]
             bath_range = [1.0, 1.5, 2.0, 2.5]
             sqft_ranges = [
@@ -380,31 +636,195 @@ class RecommendationEngine:
                 (1200, 1600),
                 (1600, 2000),
             ]
-            finish_levels = ['standard', 'premium']
-        
-        # Generate combinations
+
+        finish_levels = ["standard", "premium"]
+
         for beds, baths, (sqft_min, sqft_max), finish in product(
             bed_range, bath_range, sqft_ranges, finish_levels
         ):
-            # Skip unrealistic combinations (e.g., 1 bed / 3 baths)
             if baths > beds + 1:
                 continue
-            
-            # Use midpoint of sqft range (or could sample multiple)
-            sqft = (sqft_min + sqft_max) // 2
-            
-            configs.append({
-                'beds': beds,
-                'baths': baths,
-                'sqft': sqft,
-                'finish_level': finish,
-                'property_type': property_type,
-                'stories': 1 if sqft < 2000 else 2,  # Smaller homes typically single-story
-                'garage_spaces': 1 if property_type != 'Single Family Home' else 2
-            })
-        
-        logger.info(f"Generated {len(configs)} candidate configurations")
-        return configs
+            sqft = int((sqft_min + sqft_max) // 2)
+            configs.append(
+                {
+                    "beds": beds,
+                    "baths": baths,
+                    "sqft": sqft,
+                    "finish_level": finish,
+                    "property_type": property_type,
+                    "stories": 1 if sqft < 2000 else 2,
+                    "garage_spaces": 2
+                    if property_type == "Single Family Home"
+                    else 1,
+                }
+            )
+            if len(configs) >= max_configs:
+                break
+        return configs[:max_configs]
+
+    def _load_regional_new_build_configs(self, property_type: str) -> List[Dict[str, Any]]:
+        cache = self._load_new_build_cache()
+        if not cache:
+            return []
+        property_key = property_type.lower()
+        records: List[Dict[str, Any]] = []
+        entries = cache.get(property_key, [])
+        for entry in entries:
+            beds = self._coerce_int(entry.get("beds"))
+            baths = self._coerce_float(entry.get("baths"))
+            sqft = self._coerce_int(entry.get("sqft"))
+            if beds is None or baths is None or sqft is None:
+                continue
+            records.append(
+                {
+                    "beds": beds,
+                    "baths": baths,
+                    "sqft": sqft,
+                    "subdivision_key": entry.get("subdivision_key"),
+                }
+            )
+        return records
+
+    def _load_new_build_cache(self) -> Dict[str, Any]:
+        if self._new_build_cache is not None:
+            return self._new_build_cache
+        if self._new_build_cache_path.exists():
+            try:
+                with self._new_build_cache_path.open("r") as fh:
+                    self._new_build_cache = json.load(fh)
+            except Exception:
+                logger.warning("Failed to load new build cache from %s", self._new_build_cache_path)
+                self._new_build_cache = {}
+        else:
+            self._new_build_cache = {}
+        return self._new_build_cache
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            number = float(value)
+            if math.isnan(number):
+                return None
+            return number
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return None
+            cleaned = cleaned.replace(",", "")
+            try:
+                number = float(cleaned)
+                if math.isnan(number):
+                    return None
+                return number
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        num = RecommendationEngine._coerce_float(value)
+        if num is None:
+            return None
+        rounded = int(round(num))
+        if rounded <= 0:
+            return None
+        return rounded
+
+    @staticmethod
+    def _extract_sale_price(listing: Dict[str, Any]) -> Optional[float]:
+        summary = listing.get("summary") or {}
+        candidates = [
+            listing.get("sale_price"),
+            listing.get("price"),
+            summary.get("mlsSoldPrice"),
+            summary.get("lastSaleAmount"),
+            summary.get("price"),
+            summary.get("listingAmount"),
+        ]
+        for candidate in candidates:
+            value = RecommendationEngine._coerce_float(candidate)
+            if value is not None and value > 0:
+                return value
+        for history in listing.get("priceHistory") or []:
+            history_price = RecommendationEngine._coerce_float((history or {}).get("price"))
+            if history_price and history_price > 0:
+                event = (history or {}).get("event")
+                if isinstance(event, str) and event.lower() == "sold":
+                    return history_price
+        return None
+
+    def _compute_psf_anchor(
+        self,
+        historical_data: Optional[List[Dict[str, Any]]],
+        lot_features: Dict[str, Any],
+        percentile: float = 85.0,
+    ) -> Optional[float]:
+        if not historical_data:
+            return None
+        psf_values: List[float] = []
+        for listing in historical_data:
+            sale_price = self._extract_sale_price(listing)
+            sqft = self._coerce_float(
+                listing.get("sqft")
+                or listing.get("square_feet")
+                or (listing.get("summary") or {}).get("universalsize")
+                or (listing.get("summary") or {}).get("squareFeet")
+            )
+            if sale_price is None or sqft is None or sqft <= 0:
+                continue
+            psf = sale_price / sqft
+            if psf > 0:
+                psf_values.append(psf)
+        if not psf_values:
+            return None
+        psf_array = np.array(psf_values, dtype=float)
+        if psf_array.size == 0:
+            return None
+        percentile = max(0.0, min(100.0, percentile))
+        return float(np.percentile(psf_array, percentile))
+
+    @staticmethod
+    def _extract_property_labels(listing: Dict[str, Any]) -> str:
+        labels: List[str] = []
+        metadata = listing.get("metadata") or {}
+        for key in (
+            "property_type_category",
+            "property_type_label",
+            "raw_property_use_code",
+        ):
+            val = metadata.get(key)
+            if val:
+                labels.append(str(val))
+
+        for key in ("property_type", "propertyType"):
+            val = listing.get(key)
+            if val:
+                labels.append(str(val))
+
+        summary = listing.get("summary") or {}
+        for key in ("propertyType", "propertyUse", "propertyUseType"):
+            val = summary.get(key)
+            if val:
+                labels.append(str(val))
+
+        return " ".join(labels).lower()
+
+    @staticmethod
+    def _property_type_matches(requested: str, label_text: str) -> bool:
+        if not label_text:
+            return True
+
+        mapping = {
+            "Single Family Home": ("single", "detached", "sfr", "residence"),
+            "Townhome": ("town", "row", "attached"),
+            "Condo": ("condo", "apartment", "flat"),
+        }
+        keywords = mapping.get(requested)
+        if not keywords:
+            return True
+        return any(keyword in label_text for keyword in keywords)
     
     def _evaluate_configuration(
         self,
@@ -422,23 +842,18 @@ class RecommendationEngine:
             Evaluation dictionary or None if evaluation fails
         """
         try:
-            # Ensure models are loaded before prediction
-            if pricing_model.model is None:
-                try:
-                    pricing_model.load()
-                    logger.debug("Loaded pricing model in _evaluate_configuration")
-                except Exception as e:
-                    logger.error(f"Failed to load pricing model: {e}")
-                    return None
-            
-            if demand_model.sell_probability_model is None or demand_model.dom_model is None:
-                try:
-                    demand_model.load()
-                    logger.debug("Loaded demand model in _evaluate_configuration")
-                except Exception as e:
-                    logger.error(f"Failed to load demand model: {e}")
-                    return None
-            
+            if self._pricing_model is None or self._pricing_model.model is None:
+                logger.error("Triad pricing model not available when evaluating configuration.")
+                return None
+
+            if (
+                self._demand_model is None
+                or self._demand_model.sell_probability_model is None
+                or self._demand_model.dom_model is None
+            ):
+                logger.error("Triad demand model not available when evaluating configuration.")
+                return None
+
             # 1. Create feature vector for ML models
             # Ensure property_type is in lot_features for feature vector creation
             lot_features_with_type = lot_features.copy()
@@ -454,12 +869,47 @@ class RecommendationEngine:
             if feature_vector is None or feature_vector.empty:
                 logger.warning(f"Feature vector is None or empty for config {config}")
                 return None
+
+            pricing_features = feature_vector
+            demand_features = feature_vector
+
+            if self._pricing_model.feature_names:
+                pricing_features = feature_vector.reindex(
+                    columns=self._pricing_model.feature_names,
+                    fill_value=0.0,
+                )
+
+            if self._demand_model.feature_names:
+                demand_features = feature_vector.reindex(
+                    columns=self._demand_model.feature_names,
+                    fill_value=0.0,
+                )
             
             # 2. Predict price
-            predicted_price = pricing_model.predict(feature_vector)[0]
+            predicted_price = self._pricing_model.predict(pricing_features)[0]
+            original_model_price = float(predicted_price)
+            config_sqft = self._coerce_float(
+                config.get('sqft')
+                or config.get('square_feet')
+                or config.get('universalsize')
+            )
+            psf_anchor = self._compute_psf_anchor(historical_data, lot_features)
+            anchored_price = None
+            if (
+                psf_anchor is not None
+                and config_sqft is not None
+                and config_sqft > 0
+            ):
+                anchored_price = psf_anchor * config_sqft
+                if anchored_price > 0:
+                    anchor_weight = 0.6
+                    predicted_price = (
+                        (1 - anchor_weight) * predicted_price
+                        + anchor_weight * anchored_price
+                    )
             
             # 3. Predict demand
-            demand_pred = demand_model.predict(feature_vector)
+            demand_pred = self._demand_model.predict(demand_features)
             sell_probability = demand_pred['sell_probability'][0]
             expected_dom = demand_pred['expected_dom'][0]
             
@@ -516,6 +966,11 @@ class RecommendationEngine:
                     'fast_seller_probability': float(fast_seller_prob),
                     'fast_seller_dom': float(fast_seller_dom),
                     'meets_demand_threshold': sell_probability >= self.min_sell_probability
+                },
+                'pricing_details': {
+                    'model_price': original_model_price,
+                    'psf_anchor': float(psf_anchor) if psf_anchor is not None else None,
+                    'anchored_price': float(anchored_price) if anchored_price is not None else None,
                 },
                 'cost': {
                     'construction_cost': float(cost_breakdown.total_cost),

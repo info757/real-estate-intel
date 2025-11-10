@@ -37,8 +37,9 @@ def _build_prompt(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "numerical facts provided. Always treat sell_probability and expected_dom as the primary, "
         "model-driven metrics. Any seasonality_* fields represent historical baselines; describe them as "
         "'seasonality baseline' and never claim they boost or enhance the primary values—contrast instead. "
+        "Highlight the recommended house features listed under 'features' and explain how they influence price or DOM. "
         "Never invent data or percentages; restate what is given. Keep it to 2 short sentences, focusing "
-        "on demand velocity, pricing position, and margin."
+        "on demand velocity, pricing position, key features, and margin."
     )
 
     user_prompt = (
@@ -60,6 +61,7 @@ def _fallback_summary(metrics: Dict[str, Any]) -> str:
     cfg = metrics.get("configuration", {})
     demand = metrics.get("demand", {})
     margin = metrics.get("margin", {})
+    features = metrics.get("features") or []
 
     beds = cfg.get("beds")
     baths = cfg.get("baths")
@@ -100,6 +102,21 @@ def _fallback_summary(metrics: Dict[str, Any]) -> str:
         parts.append(f"Pricing sits at {price_ratio:.2f}× the subdivision median.")
     if inventory is not None:
         parts.append(f"Inventory trend ratio (30/90d) is {inventory:.2f}, indicating velocity.")
+    if features:
+        feature_bits = []
+        for feat in features:
+            label = feat.get("label")
+            price_lift = feat.get("price_lift")
+            dom_delta = feat.get("dom_delta")
+            snippet = label or feat.get("key", "feature")
+            if price_lift is not None:
+                snippet += f" (+${price_lift:,.0f})"
+            if dom_delta is not None:
+                snippet += f" ({dom_delta:+.0f} days)"
+            feature_bits.append(snippet)
+        parts.append(
+            "Key spec features: " + ", ".join(feature_bits[:3])
+        )
 
     return " ".join(parts)
 
